@@ -294,8 +294,7 @@ WELCOME = (
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME, parse_mode=ParseMode.MARKDOWN_V2)
-
+await update.message.reply_text(WELCOME)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
