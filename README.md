@@ -54,34 +54,24 @@ restricts bots to:
 - Downloading files **up to 20 MB**
 - Uploading files **up to 50 MB**
 
-These are Telegram-side limits, not something this bot can bypass on its own.
-
-### Raising the limit: run your own local Bot API server
-
-Telegram provides an open-source [Bot API server](https://github.com/tdlib/telegram-bot-api)
-you can self-host, which raises these limits to **~2000 MB**. Rough steps:
+These are Telegram-side limits, not something this bot's code can bypass on
+its own — you need to run your own Bot API server to raise them. This repo
+is set up to do that on Railway; see **"Sending videos over 20MB"** below for
+the full walkthrough. For a local (non-Railway) run, the short version is:
 
 ```bash
-# Build/run (see the repo for full instructions and Docker option)
 docker run -d -p 8081:8081 \
   -e TELEGRAM_API_ID=<your_api_id> \
   -e TELEGRAM_API_HASH=<your_api_hash> \
   -v telegram-bot-api-data:/var/lib/telegram-bot-api \
   aiogram/telegram-bot-api:latest
-```
 
-You get `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` from https://my.telegram.org.
-
-Then point this bot at your local server:
-
-```bash
 export LOCAL_BOT_API_URL="http://localhost:8081"
 export BOT_TOKEN="..."
 python bot.py
 ```
 
-The script auto-detects `LOCAL_BOT_API_URL` and raises its internal size
-limits accordingly.
+(get `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` from https://my.telegram.org)
 
 ## Adjusting compression presets
 
@@ -119,16 +109,66 @@ deploys/restarts. That's fine here — the bot only ever uses temp folders for t
 duration of a single compression job and deletes them immediately after. No
 persistent volume needed.
 
-**File size limits still apply on Railway.** The 20 MB download / 50 MB upload
-caps are enforced by Telegram's regular Bot API regardless of where the bot
-runs. Self-hosting a local Bot API server to raise this (see above) is possible
-on Railway too — it would mean deploying `telegram-bot-api` as a second Railway
-service and pointing `LOCAL_BOT_API_URL` at its internal Railway URL — but it's
-an extra moving part, so only bother if you actually need bigger files.
+**File size limits still apply on Railway** unless you self-host a local Bot
+API server — see the next section, it's not optional if you need files over
+20/50MB.
 
-**Costs / sleeping:** Railway's free tier has monthly usage limits and can sleep
-inactive services depending on your plan. A polling bot needs to stay running
-continuously to receive messages, so keep an eye on your plan's always-on
+## Sending videos over 20MB (up to ~2000MB / 2GB)
+
+Telegram's regular Bot API caps bots at downloading 20MB and uploading 50MB —
+this is enforced by Telegram's servers, not by this bot's code, so there's no
+setting in `bot.py` that raises it. The only way around it is to run your
+**own** Bot API server, which Telegram officially supports and which raises
+both limits to ~2000MB.
+
+This repo includes a ready-to-deploy `bot-api-server/` folder for exactly that.
+
+### 1. Get personal API credentials
+
+Go to https://my.telegram.org → log in with your phone number → **API
+development tools** → create an app. You'll get an `api_id` (number) and
+`api_hash` (string). These are tied to your personal Telegram account —
+keep them private, don't commit them to the repo.
+
+### 2. Deploy the local Bot API server as a second Railway service
+
+In your existing Railway **project** (not a new project — same project as
+your bot):
+1. **New Service → GitHub repo** → pick this same repo again.
+2. Under **Settings → Source**, set the **Root Directory** to `bot-api-server`
+   so Railway builds *that* Dockerfile instead of the bot's.
+3. Under **Variables**, add:
+   - `TELEGRAM_API_ID` = your api_id from step 1
+   - `TELEGRAM_API_HASH` = your api_hash from step 1
+4. Deploy. Check logs for it starting up and listening on port 8081.
+5. Note the service's name (shown at the top of the service page) — Railway
+   gives every service in a project an internal address at
+   `<service-name>.railway.internal`, reachable only by other services in the
+   same project (not the public internet, which is what you want here).
+
+### 3. Point the bot at it
+
+On your **bot** service (the original one), add this variable:
+
+```
+LOCAL_BOT_API_URL=http://<bot-api-server-service-name>.railway.internal:8081
+```
+
+Replace `<bot-api-server-service-name>` with whatever Railway named that
+second service (e.g. if Railway calls it `bot-api-server`, use
+`http://bot-api-server.railway.internal:8081`). `bot.py` already detects this
+env var and both raises its internal size limits to 2000MB and points all
+Telegram API calls at your own server instead of `api.telegram.org`.
+
+Redeploy the bot service, and you should now be able to send/receive files up
+to ~2GB, limited in practice by how much RAM/CPU your Railway plan gives the
+video-encoding step more than by Telegram itself.
+
+**Costs:** two Railway services means roughly double the usage/cost versus
+running just the bot, plus Railway's free tier has monthly usage limits and
+can sleep inactive services depending on your plan. Both services need to
+stay running continuously (the bot polls Telegram, so it can't be "woken up"
+by traffic like a web server can) — keep an eye on your plan's always-on
 allowance.
 
 ## Running it 24/7 (non-Docker hosts)
