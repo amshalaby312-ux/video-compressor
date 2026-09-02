@@ -61,6 +61,13 @@ from telegram.error import TelegramError
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 LOCAL_BOT_API_URL = os.environ.get("LOCAL_BOT_API_URL", "").strip() or None
 
+# Set this to true/1 ONLY if LOCAL_BOT_API_URL points at a telegram-bot-api
+# server that was started with --local *and* shares this container's
+# filesystem (see entrypoint.sh). When true, getFile() returns an absolute
+# path already on disk instead of something we need to download over HTTP -
+# this is what avoids the flaky /file/bot/... 404s entirely.
+TELEGRAM_LOCAL = os.environ.get("TELEGRAM_LOCAL", "").strip().lower() in ("1", "true", "yes")
+
 # Regular Bot API hard limits (bytes). If using a local Bot API server,
 # these are effectively much higher (~2000 MB) - adjust if you run one.
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024 if not LOCAL_BOT_API_URL else 2000 * 1024 * 1024
@@ -410,8 +417,23 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   tg_file_obj.file_id, tg_file_obj.file_unique_id, file_size, kind)
         tg_file = await tg_file_obj.get_file()
         log.info("get_file() OK -> file_path=%s file_size=%s", tg_file.file_path, tg_file.file_size)
-        await tg_file.download_to_drive(custom_path=str(src_path))
-        log.info("Download OK -> %s (%s bytes on disk)", src_path, src_path.stat().st_size if src_path.exists() else -1)
+
+        raw_path = str(tg_file.file_path or "")
+        if TELEGRAM_LOCAL and raw_path and not raw_path.startswith(("http://", "https://")):
+            # --local server: file_path is already an absolute path on disk
+            # that this container shares with the API server. Copy instead
+            # of doing a network round-trip through the /file/bot endpoint.
+            local_src = Path(raw_path)
+            if not local_src.exists():
+                raise FileNotFoundError(
+                    f"telegram-bot-api reported the file at {local_src}, but it "
+                    f"isn't on disk here - check both processes share a filesystem."
+                )
+            shutil.copy(local_src, src_path)
+            log.info("Local copy OK -> %s (%s bytes on disk)", src_path, src_path.stat().st_size)
+        else:
+            await tg_file.download_to_drive(custom_path=str(src_path))
+            log.info("Download OK -> %s (%s bytes on disk)", src_path, src_path.stat().st_size if src_path.exists() else -1)
     except TelegramError as e:
         log.exception("TelegramError while fetching/downloading file")
         await status_msg.edit_text(
@@ -513,6 +535,9 @@ def main():
         log.info("  api base_url  = %s", api_base)
         log.info("  file base_url = %s", file_base)
         builder = builder.base_url(api_base).base_file_url(file_base)
+        if TELEGRAM_LOCAL:
+            builder = builder.local_mode(True)
+            log.info("  TELEGRAM_LOCAL=1 -> local_mode enabled (files read from shared disk, not downloaded)")
     else:
         log.info("LOCAL_BOT_API_URL not set -> using default api.telegram.org "
                   "(20MB download / 50MB upload limits apply)")
