@@ -294,7 +294,8 @@ WELCOME = (
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-await update.message.reply_text(WELCOME)
+    await update.message.reply_text(WELCOME, parse_mode=ParseMode.MARKDOWN_V2)
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
@@ -405,10 +406,25 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+        log.info("Fetching file: file_id=%s file_unique_id=%s reported_size=%s kind=%s",
+                  tg_file_obj.file_id, tg_file_obj.file_unique_id, file_size, kind)
         tg_file = await tg_file_obj.get_file()
+        log.info("get_file() OK -> file_path=%s file_size=%s", tg_file.file_path, tg_file.file_size)
         await tg_file.download_to_drive(custom_path=str(src_path))
+        log.info("Download OK -> %s (%s bytes on disk)", src_path, src_path.stat().st_size if src_path.exists() else -1)
     except TelegramError as e:
-        await status_msg.edit_text(f"❌ Failed to download file: {e}")
+        log.exception("TelegramError while fetching/downloading file")
+        await status_msg.edit_text(
+            f"❌ Failed to download file from Telegram.\n"
+            f"Error: {e}\n\n"
+            f"If this keeps happening even for small files, check the bot's "
+            f"Railway logs for the full traceback — I logged extra detail there."
+        )
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return
+    except Exception as e:
+        log.exception("Unexpected error while fetching/downloading file")
+        await status_msg.edit_text(f"❌ Unexpected error downloading file: {e}")
         shutil.rmtree(job_dir, ignore_errors=True)
         return
 
@@ -491,7 +507,15 @@ def main():
 
     builder = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup_check)
     if LOCAL_BOT_API_URL:
-        builder = builder.base_url(f"{LOCAL_BOT_API_URL}/bot").base_file_url(f"{LOCAL_BOT_API_URL}/file/bot")
+        api_base = f"{LOCAL_BOT_API_URL}/bot"
+        file_base = f"{LOCAL_BOT_API_URL}/file/bot"
+        log.info("LOCAL_BOT_API_URL is set -> using self-hosted API at %s", LOCAL_BOT_API_URL)
+        log.info("  api base_url  = %s", api_base)
+        log.info("  file base_url = %s", file_base)
+        builder = builder.base_url(api_base).base_file_url(file_base)
+    else:
+        log.info("LOCAL_BOT_API_URL not set -> using default api.telegram.org "
+                  "(20MB download / 50MB upload limits apply)")
 
     app = builder.build()
 
