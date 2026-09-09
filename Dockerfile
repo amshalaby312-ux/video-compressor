@@ -1,14 +1,10 @@
 # Stage 1: grab the prebuilt Telegram Bot API server binary
 FROM aiogram/telegram-bot-api:latest AS botapi
 
-# Stage 2: your actual bot image
-FROM python:3.12-slim
+# Stage 2: your actual bot image — Alpine, to match the musl-linked binary above
+FROM python:3.12-alpine
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ffmpeg \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ffmpeg ca-certificates
 
 # Bring in the telegram-bot-api server binary from stage 1
 COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
