@@ -1,558 +1,557 @@
-#!/usr/bin/env python3
-"""
-Telegram Video/PDF Compressor Bot
-==================================
-
-Send the bot a video or a PDF. It downloads the file, compresses it
-(ffmpeg for video, Ghostscript for PDF), and sends the compressed file
-back to you along with before/after size stats.
-
-Setup:
-    1. pip install -r requirements.txt
-    2. Install system deps: ffmpeg, ghostscript
-       - Debian/Ubuntu: sudo apt install ffmpeg ghostscript
-       - macOS:         brew install ffmpeg ghostscript
-    3. Get a bot token from @BotFather on Telegram
-    4. export BOT_TOKEN="123456:ABC-your-token"
-    5. python bot.py
-
-Notes on Telegram limits:
-    - Regular Bot API: bots can download files up to 20 MB and upload
-      files up to 50 MB.
-    - If you run your own local Bot API server (telegram-bot-api),
-      those limits rise to ~2000 MB. This script auto-detects a
-      LOCAL_BOT_API_URL env var and uses it if set; see README.md.
-"""
-
-from __future__ import annotations
-
+import os
 import asyncio
 import logging
-import os
-import shutil
-import subprocess
 import tempfile
-import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.constants import ChatAction, ParseMode
+from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
-from telegram.error import TelegramError
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
+# ============================================================
+# Configuration
+# ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-LOCAL_BOT_API_URL = os.environ.get("LOCAL_BOT_API_URL", "").strip() or None
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Set this to true/1 ONLY if LOCAL_BOT_API_URL points at a telegram-bot-api
-# server that was started with --local *and* shares this container's
-# filesystem (see entrypoint.sh). When true, getFile() returns an absolute
-# path already on disk instead of something we need to download over HTTP -
-# this is what avoids the flaky /file/bot/... 404s entirely.
-TELEGRAM_LOCAL = os.environ.get("TELEGRAM_LOCAL", "").strip().lower() in ("1", "true", "yes")
+# URL of the Local Telegram Bot API server.
+#
+# In Railway, if your service is called "telegram-api", Railway
+# will provide an internal hostname. Set TELEGRAM_API_URL to:
+#
+# http://telegram-api:8081
+#
+TELEGRAM_API_URL = os.getenv(
+    "TELEGRAM_API_URL",
+    "http://localhost:8081",
+)
 
-# Regular Bot API hard limits (bytes). If using a local Bot API server,
-# these are effectively much higher (~2000 MB) - adjust if you run one.
-MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024 if not LOCAL_BOT_API_URL else 2000 * 1024 * 1024
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024 if not LOCAL_BOT_API_URL else 2000 * 1024 * 1024
+# Maximum output resolution.
+# 1280 means 720p/1080p videos can be reduced to max 1280px wide.
+MAX_WIDTH = int(os.getenv("MAX_WIDTH", "1280"))
 
-WORKDIR = Path(tempfile.gettempdir()) / "tg_compressor_bot"
-WORKDIR.mkdir(parents=True, exist_ok=True)
+# CRF:
+# Lower = better quality + larger file
+# Higher = lower quality + smaller file
+#
+# 28 is a good starting point for this bot.
+CRF = os.getenv("CRF", "28")
+
+# FFmpeg encoding preset.
+#
+# Slower presets generally compress better but use more CPU.
+PRESET = os.getenv("PRESET", "medium")
+
+# Audio bitrate.
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "96k")
+
+# Temporary working directory.
+TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
+
+
+# ============================================================
+# Logging
+# ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("compressor_bot")
+
+logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------
-# Per-user settings (in-memory; swap for a DB if you need persistence)
-# --------------------------------------------------------------------------
+# ============================================================
+# Validation
+# ============================================================
 
-@dataclass
-class UserSettings:
-    video_preset: str = "medium"   # "high" | "medium" | "low" | "tiny"
-    pdf_preset: str = "ebook"      # ghostscript -dPDFSETTINGS value
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set.")
 
 
-USER_SETTINGS: dict[int, UserSettings] = {}
-
-
-def get_settings(user_id: int) -> UserSettings:
-    return USER_SETTINGS.setdefault(user_id, UserSettings())
-
-
-VIDEO_PRESETS = {
-    # name: (crf, extra scale filter or None, x264 preset)
-    "high":   dict(crf=20, scale=None, speed="slow", label="High quality (larger file)"),
-    "medium": dict(crf=25, scale=None, speed="medium", label="Medium (recommended)"),
-    "low":    dict(crf=30, scale="-2:720", speed="medium", label="Low (720p, smaller)"),
-    "tiny":   dict(crf=34, scale="-2:480", speed="fast", label="Tiny (480p, max compression)"),
-}
-
-PDF_PRESETS = {
-    "prepress": "High quality (300 dpi images, larger file)",
-    "printer":  "Print quality (300 dpi, good compression)",
-    "ebook":    "Medium quality (150 dpi, recommended)",
-    "screen":   "Max compression (72 dpi, smallest file)",
-}
-
-
-# --------------------------------------------------------------------------
+# ============================================================
 # Helpers
-# --------------------------------------------------------------------------
+# ============================================================
 
-def human_size(num_bytes: float) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if abs(num_bytes) < 1024.0:
-            return f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1024.0
-    return f"{num_bytes:.1f} TB"
+def format_size(size: int) -> str:
+    """Convert bytes to a human-readable size."""
 
+    units = ["B", "KB", "MB", "GB", "TB"]
 
-async def run_subprocess(cmd: list[str], timeout: int = 1800) -> tuple[int, str, str]:
-    """Run a subprocess off the event loop thread and return (rc, stdout, stderr)."""
-    def _run():
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-        )
-        return proc.returncode, proc.stdout.decode(errors="replace"), proc.stderr.decode(errors="replace")
+    value = float(size)
 
-    return await asyncio.to_thread(_run)
+    for unit in units:
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+
+        value /= 1024
+
+    return f"{value:.1f} PB"
 
 
-def check_binary(name: str) -> bool:
-    return shutil.which(name) is not None
+def get_video_filter() -> str:
+    """
+    Scale the video down so its width does not exceed MAX_WIDTH.
+
+    - Keeps aspect ratio.
+    - -2 ensures dimensions remain compatible with H.264.
+    """
+
+    return (
+        f"scale='min({MAX_WIDTH},iw)':-2"
+    )
 
 
-# --------------------------------------------------------------------------
-# Video compression
-# --------------------------------------------------------------------------
-
-async def probe_duration(path: Path) -> Optional[float]:
-    """Return duration in seconds via ffprobe, or None if unknown."""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
-    rc, out, _ = await run_subprocess(cmd, timeout=30)
-    if rc == 0:
-        try:
-            return float(out.strip())
-        except ValueError:
-            return None
-    return None
-
+# ============================================================
+# FFmpeg
+# ============================================================
 
 async def compress_video(
-    src: Path,
-    dst: Path,
-    preset_name: str,
-    progress_cb=None,
-) -> tuple[bool, str]:
+    input_path: str,
+    output_path: str,
+) -> None:
     """
-    Compress a video with ffmpeg using H.264 + CRF (constant quality).
-    Audio is transcoded to AAC at a modest bitrate to also shrink audio size.
-    Returns (success, message).
+    Compress a video using FFmpeg.
     """
-    preset = VIDEO_PRESETS.get(preset_name, VIDEO_PRESETS["medium"])
-    crf = preset["crf"]
-    speed = preset["speed"]
-    scale = preset["scale"]
 
-    duration = await probe_duration(src)
+    video_filter = get_video_filter()
 
-    vf_args = []
-    if scale:
-        vf_args = ["-vf", f"scale={scale}"]
+    command = [
+        "ffmpeg",
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(src),
-        *vf_args,
-        "-c:v", "libx264",
-        "-crf", str(crf),
-        "-preset", speed,
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        "-progress", "pipe:1",
-        "-nostats",
-        str(dst),
+        "-y",
+
+        "-i",
+        input_path,
+
+        # Video
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        PRESET,
+
+        "-crf",
+        CRF,
+
+        "-vf",
+        video_filter,
+
+        # Audio
+        "-c:a",
+        "aac",
+
+        "-b:a",
+        AUDIO_BITRATE,
+
+        # Makes MP4 start playing sooner when downloaded/streamed.
+        "-movflags",
+        "+faststart",
+
+        output_path,
     ]
 
-    def _run_with_progress():
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+    logger.info("Running FFmpeg: %s", " ".join(command))
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        error = stderr.decode(errors="replace")
+
+        logger.error("FFmpeg failed:\n%s", error)
+
+        raise RuntimeError(
+            f"FFmpeg failed with exit code {process.returncode}"
         )
-        last_pct = -1
-        for line in proc.stdout:
-            if progress_cb and duration and "out_time_ms=" in line:
-                try:
-                    out_time_ms = int(line.strip().split("=")[1])
-                    pct = min(99, int((out_time_ms / 1_000_000) / duration * 100))
-                    if pct != last_pct:
-                        last_pct = pct
-                        progress_cb(pct)
-                except Exception:
-                    pass
-        proc.wait()
-        return proc.returncode
 
-    rc = await asyncio.to_thread(_run_with_progress)
-    if rc != 0 or not dst.exists():
-        return False, "ffmpeg failed to compress the video."
-    return True, "ok"
+    logger.info("FFmpeg compression completed.")
 
 
-# --------------------------------------------------------------------------
-# PDF compression
-# --------------------------------------------------------------------------
+# ============================================================
+# Telegram
+# ============================================================
 
-async def compress_pdf(src: Path, dst: Path, preset_name: str) -> tuple[bool, str]:
-    """
-    Compress a PDF with Ghostscript (downsamples images, this is where
-    most of the size reduction in a scanned/image-heavy PDF comes from).
-    Falls back to a no-op copy if Ghostscript isn't available or the
-    result isn't actually smaller.
-    """
-    preset = preset_name if preset_name in PDF_PRESETS else "ebook"
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
-    if check_binary("gs"):
-        cmd = [
-            "gs",
-            "-sDEVICE=pdfwrite",
-            "-dCompatibilityLevel=1.5",
-            f"-dPDFSETTINGS=/{preset}",
-            "-dNOPAUSE", "-dQUIET", "-dBATCH",
-            "-dDetectDuplicateImages=true",
-            "-dCompressFonts=true",
-            "-dSubsetFonts=true",
-            f"-sOutputFile={dst}",
-            str(src),
-        ]
-        rc, out, err = await run_subprocess(cmd, timeout=1200)
-        if rc == 0 and dst.exists():
-            # Ghostscript sometimes produces a *larger* file for already-
-            # optimized PDFs. If so, just keep the original.
-            if dst.stat().st_size >= src.stat().st_size:
-                shutil.copyfile(src, dst)
-                return True, "Already optimized - Ghostscript couldn't shrink it further, sending as-is."
-            return True, "ok"
-        log.warning("Ghostscript failed (rc=%s): %s", rc, err[:500])
-
-    # Fallback: try pikepdf (lossless stream recompression only)
-    try:
-        import pikepdf
-        with pikepdf.open(src) as pdf:
-            pdf.save(dst, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
-        if dst.exists() and dst.stat().st_size < src.stat().st_size:
-            return True, "ok (lossless mode - install ghostscript for much better compression)"
-        else:
-            shutil.copyfile(src, dst)
-            return True, "Couldn't shrink further without Ghostscript installed; sending original."
-    except Exception as e:
-        return False, f"No compressor available (install ghostscript): {e}"
-
-
-# --------------------------------------------------------------------------
-# Telegram handlers
-# --------------------------------------------------------------------------
-
-WELCOME = (
-    "👋 *Video/PDF Compressor Bot*\n\n"
-    "Send me a video or a PDF and I'll compress it and send it back.\n\n"
-    "Commands:\n"
-    "/settings \\- choose video/PDF compression level\n"
-    "/help \\- show this message\n\n"
-    f"⚠️ Regular Telegram bots can only *download* files up to "
-    f"{human_size(MAX_DOWNLOAD_BYTES)} and *upload* up to {human_size(MAX_UPLOAD_BYTES)}\\. "
-    "See README for how to raise this with a local Bot API server\\."
-)
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME, parse_mode=ParseMode.MARKDOWN_V2)
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cmd_start(update, context)
-
-
-async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    settings = get_settings(update.effective_user.id)
-    buttons = [
-        [InlineKeyboardButton(f"🎬 Video: {settings.video_preset}", callback_data="menu_video")],
-        [InlineKeyboardButton(f"📄 PDF: {settings.pdf_preset}", callback_data="menu_pdf")],
-    ]
     await update.message.reply_text(
-        "Choose what to configure:",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        "🎥 Send me a video and I'll compress it for you.\n\n"
+        "You can also forward a video to me."
     )
 
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    settings = get_settings(user_id)
-    data = query.data
+async def process_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    original_size: int | None,
+    filename: str,
+) -> None:
 
-    if data == "menu_video":
-        buttons = [
-            [InlineKeyboardButton(v["label"], callback_data=f"set_video_{k}")]
-            for k, v in VIDEO_PRESETS.items()
-        ]
-        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="menu_back")])
-        await query.edit_message_text("Pick video compression level:", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data == "menu_pdf":
-        buttons = [
-            [InlineKeyboardButton(v, callback_data=f"set_pdf_{k}")]
-            for k, v in PDF_PRESETS.items()
-        ]
-        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="menu_back")])
-        await query.edit_message_text("Pick PDF compression level:", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data.startswith("set_video_"):
-        settings.video_preset = data.removeprefix("set_video_")
-        await query.edit_message_text(f"✅ Video preset set to *{settings.video_preset}*", parse_mode=ParseMode.MARKDOWN)
-
-    elif data.startswith("set_pdf_"):
-        settings.pdf_preset = data.removeprefix("set_pdf_")
-        await query.edit_message_text(f"✅ PDF preset set to *{settings.pdf_preset}*", parse_mode=ParseMode.MARKDOWN)
-
-    elif data == "menu_back":
-        buttons = [
-            [InlineKeyboardButton(f"🎬 Video: {settings.video_preset}", callback_data="menu_video")],
-            [InlineKeyboardButton(f"📄 PDF: {settings.pdf_preset}", callback_data="menu_pdf")],
-        ]
-        await query.edit_message_text("Choose what to configure:", reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unified handler for videos and PDFs sent as video/document/etc."""
     message = update.effective_message
-    user_id = update.effective_user.id
-    settings = get_settings(user_id)
 
-    tg_file_obj = None
-    file_name = None
-    file_size = None
-    kind = None  # "video" or "pdf"
-
-    if message.video:
-        tg_file_obj = message.video
-        file_name = tg_file_obj.file_name or f"video_{tg_file_obj.file_unique_id}.mp4"
-        file_size = tg_file_obj.file_size
-        kind = "video"
-    elif message.document:
-        doc = message.document
-        mime = (doc.mime_type or "").lower()
-        name = (doc.file_name or "").lower()
-        if mime.startswith("video/") or name.endswith((".mp4", ".mov", ".mkv", ".avi", ".webm")):
-            tg_file_obj = doc
-            file_name = doc.file_name or f"video_{doc.file_unique_id}.mp4"
-            file_size = doc.file_size
-            kind = "video"
-        elif mime == "application/pdf" or name.endswith(".pdf"):
-            tg_file_obj = doc
-            file_name = doc.file_name or f"file_{doc.file_unique_id}.pdf"
-            file_size = doc.file_size
-            kind = "pdf"
-        else:
-            await message.reply_text("I only compress videos and PDFs. Send one of those 🙂")
-            return
-    else:
+    if message is None:
         return
 
-    if file_size and file_size > MAX_DOWNLOAD_BYTES:
-        await message.reply_text(
-            f"That file is {human_size(file_size)}, which is over the "
-            f"{human_size(MAX_DOWNLOAD_BYTES)} download limit for this bot. "
-            "See README.md for running a local Bot API server to raise this limit."
-        )
-        return
+    chat_id = message.chat_id
 
-    job_dir = WORKDIR / f"{user_id}_{int(time.time()*1000)}"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    src_path = job_dir / file_name
-    ext = ".mp4" if kind == "video" else ".pdf"
-    dst_path = job_dir / (Path(file_name).stem + "_compressed" + ext)
+    # --------------------------------------------------------
+    # Create temporary directory
+    # --------------------------------------------------------
 
-    status_msg = await message.reply_text("⬇️ Downloading...")
-
-    try:
-        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-        log.info("Fetching file: file_id=%s file_unique_id=%s reported_size=%s kind=%s",
-                  tg_file_obj.file_id, tg_file_obj.file_unique_id, file_size, kind)
-        tg_file = await tg_file_obj.get_file()
-        log.info("get_file() OK -> file_path=%s file_size=%s", tg_file.file_path, tg_file.file_size)
-
-        raw_path = str(tg_file.file_path or "")
-        if TELEGRAM_LOCAL and raw_path and not raw_path.startswith(("http://", "https://")):
-            # --local server: file_path is already an absolute path on disk
-            # that this container shares with the API server. Copy instead
-            # of doing a network round-trip through the /file/bot endpoint.
-            local_src = Path(raw_path)
-            if not local_src.exists():
-                raise FileNotFoundError(
-                    f"telegram-bot-api reported the file at {local_src}, but it "
-                    f"isn't on disk here - check both processes share a filesystem."
-                )
-            shutil.copy(local_src, src_path)
-            log.info("Local copy OK -> %s (%s bytes on disk)", src_path, src_path.stat().st_size)
-        else:
-            await tg_file.download_to_drive(custom_path=str(src_path))
-            log.info("Download OK -> %s (%s bytes on disk)", src_path, src_path.stat().st_size if src_path.exists() else -1)
-    except TelegramError as e:
-        log.exception("TelegramError while fetching/downloading file")
-        await status_msg.edit_text(
-            f"❌ Failed to download file from Telegram.\n"
-            f"Error: {e}\n\n"
-            f"If this keeps happening even for small files, check the bot's "
-            f"Railway logs for the full traceback — I logged extra detail there."
-        )
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return
-    except Exception as e:
-        log.exception("Unexpected error while fetching/downloading file")
-        await status_msg.edit_text(f"❌ Unexpected error downloading file: {e}")
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return
-
-    original_size = src_path.stat().st_size
-
-    if kind == "video":
-        await status_msg.edit_text("🎬 Compressing video (0%)...")
-        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.RECORD_VIDEO)
-
-        loop = asyncio.get_running_loop()
-        last_edit_time = [0.0]
-
-        def progress_cb(pct: int):
-            now = time.time()
-            if now - last_edit_time[0] > 3:  # throttle edits to every 3s
-                last_edit_time[0] = now
-                asyncio.run_coroutine_threadsafe(
-                    status_msg.edit_text(f"🎬 Compressing video ({pct}%)..."),
-                    loop,
-                )
-
-        ok, msg = await compress_video(src_path, dst_path, settings.video_preset, progress_cb)
-    else:
-        await status_msg.edit_text("📄 Compressing PDF...")
-        ok, msg = await compress_pdf(src_path, dst_path, settings.pdf_preset)
-
-    if not ok:
-        await status_msg.edit_text(f"❌ Compression failed: {msg}")
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return
-
-    compressed_size = dst_path.stat().st_size
-    saved_pct = (1 - compressed_size / original_size) * 100 if original_size else 0
-
-    if compressed_size > MAX_UPLOAD_BYTES:
-        await status_msg.edit_text(
-            f"⚠️ Compressed file is still {human_size(compressed_size)}, over the "
-            f"{human_size(MAX_UPLOAD_BYTES)} upload limit. Try a smaller/lower preset "
-            "with /settings, or run a local Bot API server (see README.md)."
-        )
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return
-
-    caption = (
-        f"✅ Done!\n"
-        f"Original: {human_size(original_size)}\n"
-        f"Compressed: {human_size(compressed_size)}\n"
-        f"Saved: {saved_pct:.1f}%"
+    Path(TEMP_DIR).mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
+    # Each Telegram message gets its own temporary directory.
+    work_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"video_{message.message_id}_",
+            dir=TEMP_DIR,
+        )
+    )
+
+    input_path = work_dir / "input"
+
+    output_path = work_dir / "compressed.mp4"
+
     try:
-        await status_msg.edit_text("⬆️ Uploading result...")
-        with open(dst_path, "rb") as f:
-            if kind == "video":
-                await message.reply_video(video=f, caption=caption, filename=dst_path.name, supports_streaming=True)
-            else:
-                await message.reply_document(document=f, caption=caption, filename=dst_path.name)
-        await status_msg.delete()
-    except TelegramError as e:
-        await status_msg.edit_text(f"❌ Failed to upload result: {e}")
+
+        # ----------------------------------------------------
+        # Initial message
+        # ----------------------------------------------------
+
+        if original_size:
+            size_text = format_size(original_size)
+        else:
+            size_text = "unknown size"
+
+        await message.reply_text(
+            f"📥 Receiving video...\n"
+            f"Original size: {size_text}"
+        )
+
+        # ----------------------------------------------------
+        # Download from Telegram
+        # ----------------------------------------------------
+
+        await context.bot.send_chat_action(
+            chat_id=chat_id,
+            action=ChatAction.UPLOAD_VIDEO,
+        )
+
+        logger.info(
+            "Downloading Telegram file %s",
+            file_id,
+        )
+
+        telegram_file = await context.bot.get_file(file_id)
+
+        # Local Bot API server allows this download without
+        # the normal cloud Bot API file-size restriction.
+        await telegram_file.download_to_drive(
+            custom_path=str(input_path)
+        )
+
+        downloaded_size = input_path.stat().st_size
+
+        logger.info(
+            "Downloaded %s",
+            format_size(downloaded_size),
+        )
+
+        # ----------------------------------------------------
+        # Compress
+        # ----------------------------------------------------
+
+        await message.reply_text(
+            "⚙️ Compressing video...\n"
+            "This can take a while for large videos."
+        )
+
+        await compress_video(
+            str(input_path),
+            str(output_path),
+        )
+
+        compressed_size = output_path.stat().st_size
+
+        # ----------------------------------------------------
+        # Calculate savings
+        # ----------------------------------------------------
+
+        if downloaded_size > 0:
+
+            saved = downloaded_size - compressed_size
+
+            percentage = (
+                saved / downloaded_size
+            ) * 100
+
+        else:
+
+            saved = 0
+            percentage = 0
+
+        logger.info(
+            "Compression: %s -> %s (%.1f%% saved)",
+            format_size(downloaded_size),
+            format_size(compressed_size),
+            percentage,
+        )
+
+        # ----------------------------------------------------
+        # Send result
+        # ----------------------------------------------------
+
+        await message.reply_text(
+            "📤 Sending compressed video..."
+        )
+
+        await context.bot.send_chat_action(
+            chat_id=chat_id,
+            action=ChatAction.UPLOAD_VIDEO,
+        )
+
+        # In local_mode, python-telegram-bot can pass the
+        # local filesystem path to the Local Bot API server.
+        await message.reply_video(
+            video=str(output_path),
+            supports_streaming=True,
+            caption=(
+                f"✅ Compression complete!\n\n"
+                f"Original: {format_size(downloaded_size)}\n"
+                f"Compressed: {format_size(compressed_size)}\n"
+                f"Saved: {percentage:.1f}%"
+            ),
+        )
+
+        logger.info(
+            "Finished processing message %s",
+            message.message_id,
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Error processing video:"
+        )
+
+        await message.reply_text(
+            "❌ Something went wrong while processing "
+            "the video.\n\n"
+            f"Error: {error}"
+        )
+
     finally:
-        shutil.rmtree(job_dir, ignore_errors=True)
+
+        # ----------------------------------------------------
+        # Cleanup
+        # ----------------------------------------------------
+
+        try:
+
+            for file in work_dir.iterdir():
+
+                if file.is_file():
+                    file.unlink()
+
+            work_dir.rmdir()
+
+        except Exception:
+
+            logger.exception(
+                "Could not clean temporary files."
+            )
 
 
-async def on_startup_check(app: Application):
-    missing = []
-    if not check_binary("ffmpeg"):
-        missing.append("ffmpeg")
-    if not check_binary("ffprobe"):
-        missing.append("ffprobe")
-    if not check_binary("gs"):
-        log.warning("Ghostscript ('gs') not found - PDF compression will fall back to a weaker lossless mode.")
-    if missing:
-        log.error("Missing required binaries: %s. Install them before running.", ", ".join(missing))
+# ============================================================
+# Video handler
+# ============================================================
+
+async def handle_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    message = update.effective_message
+
+    if message is None or message.video is None:
+        return
+
+    video = message.video
+
+    filename = (
+        f"video_{message.message_id}.mp4"
+    )
+
+    await process_video(
+        update=update,
+        context=context,
+        file_id=video.file_id,
+        original_size=video.file_size,
+        filename=filename,
+    )
 
 
-def main():
-    if not BOT_TOKEN:
-        raise SystemExit("Set the BOT_TOKEN environment variable (get one from @BotFather).")
+# ============================================================
+# Document handler
+# ============================================================
 
-    builder = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup_check)
-    if LOCAL_BOT_API_URL:
-        api_base = f"{LOCAL_BOT_API_URL}/bot"
-        file_base = f"{LOCAL_BOT_API_URL}/file/bot"
-        log.info("LOCAL_BOT_API_URL is set -> using self-hosted API at %s", LOCAL_BOT_API_URL)
-        log.info("  api base_url  = %s", api_base)
-        log.info("  file base_url = %s", file_base)
-        builder = builder.base_url(api_base).base_file_url(file_base)
-        if TELEGRAM_LOCAL:
-            builder = builder.local_mode(True)
-            log.info("  TELEGRAM_LOCAL=1 -> local_mode enabled (files read from shared disk, not downloaded)")
-    else:
-        log.info("LOCAL_BOT_API_URL not set -> using default api.telegram.org "
-                  "(20MB download / 50MB upload limits apply)")
+async def handle_document(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
-    app = builder.build()
+    message = update.effective_message
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, handle_file))
+    if message is None or message.document is None:
+        return
 
-    log.info("Bot starting (download limit=%s, upload limit=%s)...",
-              human_size(MAX_DOWNLOAD_BYTES), human_size(MAX_UPLOAD_BYTES))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    document = message.document
+
+    mime_type = document.mime_type or ""
+
+    filename = document.file_name or "video"
+
+    # Telegram sometimes receives a video as a document.
+    # Accept common video MIME types and filenames.
+
+    is_video = (
+        mime_type.startswith("video/")
+        or filename.lower().endswith(
+            (
+                ".mp4",
+                ".mkv",
+                ".mov",
+                ".avi",
+                ".webm",
+                ".m4v",
+                ".mpeg",
+                ".mpg",
+                ".3gp",
+            )
+        )
+    )
+
+    if not is_video:
+
+        await message.reply_text(
+            "❌ That doesn't look like a video file."
+        )
+
+        return
+
+    await process_video(
+        update=update,
+        context=context,
+        file_id=document.file_id,
+        original_size=document.file_size,
+        filename=filename,
+    )
+
+
+# ============================================================
+# Error handler
+# ============================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    logger.exception(
+        "Unhandled Telegram error:",
+        exc_info=context.error,
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+
+    logger.info(
+        "Starting Telegram Video Compressor..."
+    )
+
+    logger.info(
+        "Local Bot API URL: %s",
+        TELEGRAM_API_URL,
+    )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+
+        # IMPORTANT:
+        # Tell python-telegram-bot to use our Local Bot API.
+        .base_url(
+            f"{TELEGRAM_API_URL}/bot{{token}}"
+        )
+        .base_file_url(
+            f"{TELEGRAM_API_URL}/file/bot{{token}}"
+        )
+
+        # Tell python-telegram-bot that this is a
+        # Local Bot API server.
+        .local_mode(True)
+
+        .build()
+    )
+
+    # Commands
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    # Videos sent normally or forwarded
+    application.add_handler(
+        MessageHandler(
+            filters.VIDEO,
+            handle_video,
+        )
+    )
+
+    # Videos sent as documents/files
+    application.add_handler(
+        MessageHandler(
+            filters.Document.ALL,
+            handle_document,
+        )
+    )
+
+    # Errors
+    application.add_error_handler(
+        error_handler
+    )
+
+    logger.info(
+        "Bot is running."
+    )
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
