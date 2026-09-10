@@ -9,7 +9,7 @@ telegram-bot-api \
   --api-hash="${TELEGRAM_API_HASH}" \
   --local \
   --http-port=8081 \
-  --dir=/data &
+  --dir=/data/telegram-api &
 
 # Give it a couple seconds to come up before the bot tries to talk to it
 sleep 3
