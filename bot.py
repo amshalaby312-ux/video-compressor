@@ -36,6 +36,16 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
 # How many seconds of the video to sample when estimating size.
 SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "8"))
 
+# Caps FFmpeg's own thread usage so it doesn't try to use more
+# CPU than the service is actually allotted (helps avoid getting
+# throttled/killed on tight Railway resource limits).
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "2")
+
+# How many level-estimates run at once during the "analyze" step.
+# Running all 5 fully in parallel spikes CPU/RAM briefly; this
+# caps it so the estimate phase stays within tight resource limits.
+ESTIMATE_CONCURRENCY = int(os.getenv("ESTIMATE_CONCURRENCY", "2"))
+
 # ============================================================
 # Compression levels
 # ============================================================
@@ -43,6 +53,11 @@ SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "8"))
 # "medium" mirrors the bot's original fixed behavior and can
 # still be tuned via env vars so existing Railway variables
 # keep working.
+#
+# lookahead/refs/bframes control libx264's internal frame
+# buffering, which is the main driver of encoder-side memory
+# use. Lower numbers = less RAM, at some cost to compression
+# efficiency (usually negligible at the CRF values used here).
 
 LEVELS: dict[str, dict] = {
     "low": {
@@ -52,6 +67,9 @@ LEVELS: dict[str, dict] = {
         "preset": "medium",
         "max_width": 1920,
         "audio_bitrate": "128k",
+        "lookahead": "20",
+        "refs": "3",
+        "bframes": "3",
     },
     "medium": {
         "label": "🟡 Medium",
@@ -60,6 +78,9 @@ LEVELS: dict[str, dict] = {
         "preset": os.getenv("PRESET", "medium"),
         "max_width": int(os.getenv("MAX_WIDTH", "1280")),
         "audio_bitrate": os.getenv("AUDIO_BITRATE", "96k"),
+        "lookahead": "15",
+        "refs": "2",
+        "bframes": "2",
     },
     "high": {
         "label": "🟠 High",
@@ -68,6 +89,9 @@ LEVELS: dict[str, dict] = {
         "preset": "fast",
         "max_width": 854,
         "audio_bitrate": "64k",
+        "lookahead": "10",
+        "refs": "1",
+        "bframes": "2",
     },
     "very_high": {
         "label": "🔴 Very High",
@@ -76,6 +100,9 @@ LEVELS: dict[str, dict] = {
         "preset": "veryfast",
         "max_width": 640,
         "audio_bitrate": "48k",
+        "lookahead": "8",
+        "refs": "1",
+        "bframes": "1",
     },
     "extreme": {
         "label": "⚫ Extreme",
@@ -84,6 +111,9 @@ LEVELS: dict[str, dict] = {
         "preset": "ultrafast",
         "max_width": 426,
         "audio_bitrate": "32k",
+        "lookahead": "5",
+        "refs": "1",
+        "bframes": "0",
     },
 }
 
@@ -281,14 +311,26 @@ def build_ffmpeg_command(
     if duration is not None:
         command += ["-t", f"{duration:.2f}"]
 
+    x264_params = (
+        f"rc-lookahead={settings['lookahead']}:"
+        f"ref={settings['refs']}:"
+        f"bframes={settings['bframes']}"
+    )
+
     command += [
         "-c:v", "libx264",
         "-preset", settings["preset"],
         "-crf", settings["crf"],
+        "-x264-params", x264_params,
+        "-threads", FFMPEG_THREADS,
         "-vf", get_video_filter(settings["max_width"]),
         "-c:a", "aac",
         "-b:a", settings["audio_bitrate"],
         "-movflags", "+faststart",
+        # Prevents an abrupt "Conversion failed!" at finalization if
+        # the muxer's internal packet queue backs up on a tight
+        # memory budget.
+        "-max_muxing_queue_size", "1024",
         output_path,
     ]
 
@@ -364,8 +406,16 @@ async def estimate_level_size(
 
 
 async def estimate_all_levels(input_path: str, duration: float | None, work_dir: Path) -> dict[str, int | None]:
+    # Limit how many sample encodes run at once — 5 fully parallel
+    # ffmpeg processes can spike CPU/RAM past tight resource limits.
+    semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+
+    async def bounded_estimate(level: str) -> int | None:
+        async with semaphore:
+            return await estimate_level_size(input_path, duration, level, work_dir)
+
     results = await asyncio.gather(
-        *(estimate_level_size(input_path, duration, level, work_dir) for level in LEVEL_ORDER),
+        *(bounded_estimate(level) for level in LEVEL_ORDER),
         return_exceptions=True,
     )
 
