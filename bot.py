@@ -1,16 +1,19 @@
 import os
 import asyncio
 import logging
+import shutil
 import tempfile
 import time
 from pathlib import Path
 
+import img2pdf
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -33,6 +36,35 @@ TELEGRAM_API_URL = os.getenv(
 
 TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
 
+# ------------------------------------------------------------
+# Access control — hard-coded on purpose (not an env var) so the
+# allowlist lives in the repo, not in Railway config. Add your
+# numeric Telegram user ID(s) here. You can get your own ID by
+# messaging @userinfobot on Telegram, or just try using this bot
+# once — it will reply with your ID so you can copy it in here.
+# ------------------------------------------------------------
+ALLOWED_USER_IDS: set[int] = {
+    111111111,  # <- replace with your Telegram user ID
+    # 222222222,  # <- add more IDs here if needed
+}
+
+
+def is_allowed(user_id: int | None) -> bool:
+    return user_id is not None and user_id in ALLOWED_USER_IDS
+
+
+async def reject_unauthorized(message, user_id: int | None) -> None:
+    await message.reply_text(
+        "⛔ You're not authorized to use this bot.\n\n"
+        f"Your Telegram user ID is: {user_id}\n"
+        "If this is your account, add that number to ALLOWED_USER_IDS in bot.py."
+    )
+
+# How many times to retry a flaky network call (download/upload)
+# before giving up, and the base delay between attempts.
+RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "5"))
+RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "3"))
+
 # How many seconds of the video to sample when estimating size.
 SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "8"))
 
@@ -45,6 +77,12 @@ FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "2")
 # Running all 5 fully in parallel spikes CPU/RAM briefly; this
 # caps it so the estimate phase stays within tight resource limits.
 ESTIMATE_CONCURRENCY = int(os.getenv("ESTIMATE_CONCURRENCY", "2"))
+
+# ------------------------------------------------------------
+# PDF frame-extraction mode
+# ------------------------------------------------------------
+PDF_INTERVALS = [15, 30, 45, 60]  # seconds
+PDF_MAX_FRAMES = 200  # safety cap so a long video can't produce a huge PDF
 
 # ============================================================
 # Compression levels
@@ -155,10 +193,7 @@ def remember_file(message_id: int, file_id: str, original_size: int | None) -> N
 
 def cleanup_work_dir(work_dir: Path) -> None:
     try:
-        for file in work_dir.iterdir():
-            if file.is_file():
-                file.unlink()
-        work_dir.rmdir()
+        shutil.rmtree(work_dir, ignore_errors=True)
     except Exception:
         logger.exception("Could not clean temporary files in %s", work_dir)
 
@@ -196,6 +231,44 @@ if not BOT_TOKEN:
 # ============================================================
 # Helpers
 # ============================================================
+
+async def with_retries(func, *args, attempts: int = RETRY_ATTEMPTS, base_delay: float = RETRY_BASE_DELAY, **kwargs):
+    """
+    Call an async Telegram API function, retrying on flaky-network
+    errors (TimedOut / NetworkError) with exponential backoff,
+    instead of failing on the first hiccup.
+    """
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await func(*args, **kwargs)
+        except (NetworkError, TimedOut) as error:
+            last_error = error
+
+            if attempt == attempts:
+                break
+
+            delay = min(base_delay * (2 ** (attempt - 1)), 30)
+
+            logger.warning(
+                "Network error on attempt %s/%s (%s) — retrying in %.0fs",
+                attempt, attempts, error, delay,
+            )
+
+            await asyncio.sleep(delay)
+
+    assert last_error is not None
+    raise last_error
+
+
+def render_progress_bar(percent: float, width: int = 14) -> str:
+    percent = max(0.0, min(100.0, percent))
+    filled = round(width * percent / 100)
+    bar = "▓" * filled + "░" * (width - filled)
+    return f"[{bar}] {percent:.0f}%"
+
 
 def format_size(size: float | None) -> str:
     if size is None:
@@ -235,10 +308,25 @@ def estimate_keyboard(message_id: int, estimates: dict[str, int | None], highlig
         ])
 
     rows.append([
+        InlineKeyboardButton("📄 Extract to PDF", callback_data=f"pdfmenu:_:{message_id}")
+    ])
+
+    rows.append([
         InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")
     ])
 
     return InlineKeyboardMarkup(rows)
+
+
+def pdf_interval_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton(f"{seconds}s", callback_data=f"pdf:{seconds}:{message_id}")
+        for seconds in PDF_INTERVALS
+    ]
+    return InlineKeyboardMarkup([
+        row,
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")],
+    ])
 
 
 def redo_keyboard(message_id: int) -> InlineKeyboardMarkup:
@@ -294,14 +382,71 @@ async def get_duration(input_path: str) -> float | None:
         return None
 
 
+async def get_video_dimensions(input_path: str) -> tuple[int | None, int | None]:
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=s=x:p=0",
+        input_path,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe (dimensions) failed: %s", stderr.decode(errors="replace"))
+        return None, None
+
+    try:
+        width_str, height_str = stdout.decode().strip().split("x")
+        return int(width_str), int(height_str)
+    except (ValueError, AttributeError):
+        return None, None
+
+
+async def generate_thumbnail(input_path: str, output_path: str, duration: float | None) -> bool:
+    """
+    Grab a frame from roughly the middle of the video as a JPEG
+    thumbnail. Telegram wants thumbnails no larger than 320px on
+    a side and under 200 KB.
+    """
+
+    seek = (duration / 2) if duration else 1.0
+
+    command = [
+        "ffmpeg", "-y",
+        "-ss", f"{seek:.2f}",
+        "-i", input_path,
+        "-frames:v", "1",
+        "-vf", "scale='min(320,iw)':-2",
+        "-q:v", "4",
+        output_path,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0 or not Path(output_path).exists():
+        logger.warning("Thumbnail generation failed: %s", stderr.decode(errors="replace"))
+        return False
+
+    return True
+
+
 def build_ffmpeg_command(
     input_path: str,
     output_path: str,
     settings: dict,
     seek: float | None = None,
     duration: float | None = None,
+    enable_progress: bool = False,
 ) -> list[str]:
     command = ["ffmpeg", "-y"]
+
+    if enable_progress:
+        # Machine-readable progress (key=value lines) on stdout,
+        # separate from the human-readable logs on stderr.
+        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
 
     if seek is not None:
         command += ["-ss", f"{seek:.2f}"]
@@ -337,20 +482,120 @@ def build_ffmpeg_command(
     return command
 
 
-async def compress_video(input_path: str, output_path: str, level: str) -> None:
+async def compress_video(
+    input_path: str,
+    output_path: str,
+    level: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+) -> None:
+    """
+    Compress a video with FFmpeg. If total_duration and a
+    progress_callback are supplied, streams real encode progress
+    (based on how much of the video's timeline has been processed)
+    to the callback as it happens.
+    """
+
     settings = LEVELS[level]
-    command = build_ffmpeg_command(input_path, output_path, settings)
+    command = build_ffmpeg_command(input_path, output_path, settings, enable_progress=True)
 
     logger.info("Running FFmpeg (%s): %s", level, " ".join(command))
 
-    returncode, stdout, stderr = await run_command(command)
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stderr_chunks: list[bytes] = []
+
+    async def drain_stderr() -> None:
+        assert process.stderr is not None
+        async for line in process.stderr:
+            stderr_chunks.append(line)
+
+    async def drain_progress() -> None:
+        # Always drain stdout — ffmpeg's progress pipe must be read
+        # continuously or its write buffer can fill and stall ffmpeg,
+        # regardless of whether we act on the values.
+        assert process.stdout is not None
+
+        async for raw_line in process.stdout:
+            if progress_callback is None or not total_duration:
+                continue
+
+            line = raw_line.decode(errors="replace").strip()
+
+            if line.startswith("out_time_ms="):
+                try:
+                    # ffmpeg's "out_time_ms" key is actually in
+                    # microseconds despite the name.
+                    processed_seconds = int(line.split("=", 1)[1]) / 1_000_000
+                except ValueError:
+                    continue
+
+                percent = (processed_seconds / total_duration) * 100
+                await progress_callback(percent)
+
+            elif line == "progress=end":
+                await progress_callback(100.0)
+
+    await asyncio.gather(drain_stderr(), drain_progress())
+    returncode = await process.wait()
 
     if returncode != 0:
-        error = stderr.decode(errors="replace")
+        error = b"".join(stderr_chunks).decode(errors="replace")
         logger.error("FFmpeg failed:\n%s", error)
         raise RuntimeError(f"FFmpeg failed with exit code {returncode}")
 
     logger.info("FFmpeg compression completed.")
+
+
+async def extract_pdf_frames(
+    input_path: str,
+    work_dir: Path,
+    interval: int,
+    max_frames: int = PDF_MAX_FRAMES,
+) -> tuple[Path | None, int, bool]:
+    """
+    Grab one frame every `interval` seconds and combine them into a
+    single PDF (one frame per page). Returns (pdf_path, frame_count,
+    was_truncated) — pdf_path is None if extraction failed outright.
+    """
+
+    frames_dir = work_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+
+    pattern = str(frames_dir / "frame_%04d.jpg")
+
+    command = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", f"fps=1/{interval}",
+        "-q:v", "3",
+        pattern,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.error("PDF frame extraction failed:\n%s", stderr.decode(errors="replace"))
+        return None, 0, False
+
+    frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
+
+    if not frame_paths:
+        return None, 0, False
+
+    truncated = len(frame_paths) > max_frames
+    frame_paths = frame_paths[:max_frames]
+
+    pdf_path = work_dir / "frames.pdf"
+
+    pdf_bytes = img2pdf.convert([str(path) for path in frame_paths])
+    pdf_path.write_bytes(pdf_bytes)
+
+    return pdf_path, len(frame_paths), truncated
 
 
 async def estimate_level_size(
@@ -436,6 +681,12 @@ async def estimate_all_levels(input_path: str, duration: float | None, work_dir:
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(update.message, user_id)
+        return
+
     await update.message.reply_text(
         "🎥 Send me a video and I'll show you estimated sizes at a "
         "few compression levels before compressing.\n\n"
@@ -448,6 +699,12 @@ async def setlevel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
 
     if message is None:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(message, user_id)
         return
 
     current = get_default_level(message.chat_id)
@@ -489,8 +746,8 @@ async def handle_incoming(
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
-        telegram_file = await context.bot.get_file(file_id)
-        await telegram_file.download_to_drive(custom_path=str(input_path))
+        telegram_file = await with_retries(context.bot.get_file, file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(input_path))
 
         downloaded_size = input_path.stat().st_size
 
@@ -510,6 +767,7 @@ async def handle_incoming(
                 "original_size": downloaded_size,
                 "filename": filename,
                 "chat_id": chat_id,
+                "duration": duration,
             },
         )
 
@@ -549,21 +807,55 @@ async def run_compression(
     chat_id: int,
     source_message_id: int,
     status_message=None,
+    duration: float | None = None,
 ) -> None:
     level_info = LEVELS[level]
     output_path = work_dir / "compressed.mp4"
 
     try:
-        text = f"⚙️ Compressing at {level_info['label']}...\nThis can take a while for large videos."
+        text = f"⚙️ Compressing at {level_info['label']}...\n{render_progress_bar(0)}"
 
         if status_message is not None:
-            await status_message.edit_text(text)
+            await with_retries(status_message.edit_text, text)
         else:
-            status_message = await context.bot.send_message(chat_id=chat_id, text=text)
+            status_message = await with_retries(context.bot.send_message, chat_id=chat_id, text=text)
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
-        await compress_video(str(input_path), str(output_path), level)
+        progress_state = {"last_percent": -10.0, "last_edit": 0.0}
+
+        async def on_progress(percent: float) -> None:
+            now = time.monotonic()
+
+            # Throttle edits so we don't hammer Telegram's rate limit —
+            # only push an update on a meaningful jump or after a
+            # few seconds, whichever comes first.
+            if (
+                percent - progress_state["last_percent"] < 4
+                and now - progress_state["last_edit"] < 3
+                and percent < 100
+            ):
+                return
+
+            progress_state["last_percent"] = percent
+            progress_state["last_edit"] = now
+
+            bar_text = f"⚙️ Compressing at {level_info['label']}...\n{render_progress_bar(percent)}"
+
+            try:
+                await status_message.edit_text(bar_text)
+            except Exception:
+                # A rate-limit hiccup or "message not modified" here
+                # shouldn't abort the actual compression.
+                pass
+
+        await compress_video(
+            str(input_path),
+            str(output_path),
+            level,
+            total_duration=duration,
+            progress_callback=on_progress if duration else None,
+        )
 
         compressed_size = output_path.stat().st_size
 
@@ -573,14 +865,29 @@ async def run_compression(
         else:
             percentage = 0
 
+        # Probe the actual compressed file for duration/dimensions
+        # (rather than reusing the source video's numbers) and grab
+        # a thumbnail frame — without these, Telegram clients show
+        # a blank 00:00 preview even though the video plays fine.
+        output_duration = await get_duration(str(output_path))
+        output_width, output_height = await get_video_dimensions(str(output_path))
+
+        thumbnail_path = work_dir / "thumb.jpg"
+        has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
+
         await status_message.edit_text("📤 Sending compressed video...")
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
-        await context.bot.send_video(
+        await with_retries(
+            context.bot.send_video,
             chat_id=chat_id,
             video=str(output_path),
             supports_streaming=True,
+            width=output_width,
+            height=output_height,
+            duration=round(output_duration) if output_duration else None,
+            thumbnail=str(thumbnail_path) if has_thumbnail else None,
             caption=(
                 f"✅ Compression complete! ({level_info['label']})\n\n"
                 f"Original: {format_size(original_size)}\n"
@@ -612,6 +919,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if message is None or message.video is None:
         return
 
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(message, user_id)
+        return
+
     video = message.video
     remember_file(message.message_id, video.file_id, video.file_size)
 
@@ -627,6 +940,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     message = update.effective_message
 
     if message is None or message.document is None:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(message, user_id)
         return
 
     document = message.document
@@ -664,6 +983,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query is None or query.data is None:
         return
 
+    user_id = query.from_user.id if query.from_user else None
+
+    if not is_allowed(user_id):
+        await query.answer(
+            f"⛔ Not authorized. Your Telegram user ID is {user_id}.",
+            show_alert=True,
+        )
+        return
+
     await query.answer()
 
     try:
@@ -691,6 +1019,81 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("❌ Cancelled — temporary files removed.")
         return
 
+    if action == "pdfmenu":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        await query.edit_message_text(
+            "Pick a screenshot interval — one frame will be captured "
+            "every N seconds and combined into a PDF:",
+            reply_markup=pdf_interval_keyboard(message_id),
+        )
+        return
+
+    if action == "pdf":
+        try:
+            interval = int(level)
+        except ValueError:
+            return
+
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+
+        await query.edit_message_text(
+            f"📄 Extracting a frame every {interval}s and building a PDF..."
+        )
+
+        try:
+            pdf_path, frame_count, truncated = await extract_pdf_frames(
+                str(input_path), work_dir, interval
+            )
+
+            if pdf_path is None:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Couldn't extract any frames from that video.",
+                )
+                return
+
+            caption = f"📄 {frame_count} frame(s), one every {interval}s."
+            if truncated:
+                caption += f"\n⚠️ Capped at {PDF_MAX_FRAMES} frames to keep the PDF a reasonable size."
+
+            await with_retries(
+                context.bot.send_document,
+                chat_id=chat_id,
+                document=str(pdf_path),
+                filename="frames.pdf",
+                caption=caption,
+            )
+
+        except Exception as error:
+            logger.exception("Error extracting PDF:")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Something went wrong extracting frames.\n\nError: {error}",
+            )
+
+        finally:
+            cleanup_work_dir(work_dir)
+            pending_compressions.pop(message_id, None)
+
+        return
+
     if level not in LEVELS:
         return
 
@@ -712,6 +1115,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             chat_id=pending["chat_id"],
             source_message_id=message_id,
             status_message=query.message,
+            duration=pending.get("duration"),
         )
         return
 
@@ -734,13 +1138,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         input_path = work_dir / "input"
 
         try:
-            telegram_file = await context.bot.get_file(cached["file_id"])
-            await telegram_file.download_to_drive(custom_path=str(input_path))
+            telegram_file = await with_retries(context.bot.get_file, cached["file_id"])
+            await with_retries(telegram_file.download_to_drive, custom_path=str(input_path))
         except Exception as error:
             logger.exception("Error re-downloading for redo:")
             cleanup_work_dir(work_dir)
             await query.message.reply_text(f"❌ Couldn't re-download the video.\n\nError: {error}")
             return
+
+        duration = await get_duration(str(input_path))
 
         await run_compression(
             update, context,
@@ -750,6 +1156,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             level=level,
             chat_id=chat_id,
             source_message_id=message_id,
+            duration=duration,
         )
 
 
@@ -775,6 +1182,15 @@ def main() -> None:
         .base_url(f"{TELEGRAM_API_URL}/bot{{token}}")
         .base_file_url(f"{TELEGRAM_API_URL}/file/bot{{token}}")
         .local_mode(True)
+        # Defaults here are just a few seconds, which is nowhere near
+        # enough for large video downloads/uploads through the Local
+        # Bot API server — this is almost certainly why timeouts were
+        # happening in the first place.
+        .read_timeout(600)
+        .write_timeout(600)
+        .connect_timeout(60)
+        .pool_timeout(60)
+        .media_write_timeout(600)
         .build()
     )
 
