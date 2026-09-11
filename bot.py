@@ -44,8 +44,13 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
 # once — it will reply with your ID so you can copy it in here.
 # ------------------------------------------------------------
 ALLOWED_USER_IDS: set[int] = {
-    111111111,  # <- replace with your Telegram user ID
-    # 222222222,  # <- add more IDs here if needed
+    940770584,  # <- replace with your Telegram user ID
+     222222222,
+     222222222,
+     222222222,
+     222222222,
+     222222222,
+     222222222,# <- add more IDs here if needed
 }
 
 
@@ -56,8 +61,7 @@ def is_allowed(user_id: int | None) -> bool:
 async def reject_unauthorized(message, user_id: int | None) -> None:
     await message.reply_text(
         "⛔ You're not authorized to use this bot.\n\n"
-        f"Your Telegram user ID is: {user_id}\n"
-        "If this is your account, add that number to ALLOWED_USER_IDS in bot.py."
+        f"byeee"
     )
 
 # How many times to retry a flaky network call (download/upload)
@@ -157,7 +161,7 @@ LEVELS: dict[str, dict] = {
 
 LEVEL_ORDER = ["low", "medium", "high", "very_high", "extreme"]
 
-DEFAULT_LEVEL = "medium"
+DEFAULT_LEVEL = "high"
 
 # Per-chat default level, used only to mark which button is
 # starred in the estimate menu.
@@ -173,7 +177,7 @@ PENDING_MAX = 5
 # Small cache so "redo at a different level" on an already-sent
 # result can re-fetch the source without asking you to resend.
 recent_files: dict[int, dict] = {}
-RECENT_FILES_MAX = 200
+RECENT_FILES_MAX = 250
 
 
 def get_default_level(chat_id: int) -> str:
@@ -741,7 +745,7 @@ async def handle_incoming(
         size_text = format_size(original_size)
 
         status_message = await message.reply_text(
-            f"📥 Downloading video ({size_text})..."
+            f"📥 Downloading video! ({size_text})..."
         )
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
@@ -793,7 +797,7 @@ async def handle_incoming(
         cleanup_work_dir(work_dir)
         pending_compressions.pop(message.message_id, None)
         await message.reply_text(
-            f"❌ Something went wrong while analyzing the video.\n\nError: {error}"
+            f"❌ Something went wrong while analyzing the video lol.\n\nError: {error}"
         )
 
 
@@ -960,7 +964,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     if not is_video:
-        await message.reply_text("❌ That doesn't look like a video file.")
+        await message.reply_text("❌ That doesn't look like a video file! هنضحك على بعض؟")
         return
 
     remember_file(message.message_id, document.file_id, document.file_size)
@@ -987,7 +991,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not is_allowed(user_id):
         await query.answer(
-            f"⛔ Not authorized. Your Telegram user ID is {user_id}.",
+            f"⛔ Not authorized. ask for permission first from the Creator",
             show_alert=True,
         )
         return
