@@ -44,13 +44,8 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
 # once — it will reply with your ID so you can copy it in here.
 # ------------------------------------------------------------
 ALLOWED_USER_IDS: set[int] = {
-    940770584,  # <- replace with your Telegram user ID
-     222222222,
-     222222222,
-     222222222,
-     222222222,
-     222222222,
-     222222222,# <- add more IDs here if needed
+    111111111,  # <- replace with your Telegram user ID
+    # 222222222,  # <- add more IDs here if needed
 }
 
 
@@ -61,7 +56,8 @@ def is_allowed(user_id: int | None) -> bool:
 async def reject_unauthorized(message, user_id: int | None) -> None:
     await message.reply_text(
         "⛔ You're not authorized to use this bot.\n\n"
-        f"byeee"
+        f"Your Telegram user ID is: {user_id}\n"
+        "If this is your account, add that number to ALLOWED_USER_IDS in bot.py."
     )
 
 # How many times to retry a flaky network call (download/upload)
@@ -87,6 +83,12 @@ ESTIMATE_CONCURRENCY = int(os.getenv("ESTIMATE_CONCURRENCY", "2"))
 # ------------------------------------------------------------
 PDF_INTERVALS = [15, 30, 45, 60]  # seconds
 PDF_MAX_FRAMES = 200  # safety cap so a long video can't produce a huge PDF
+
+# How close two frames' tiny grayscale signatures must be (average
+# per-pixel difference, 0-255 scale) to count as "extremely similar"
+# for the auto-delete-similar-frames step. Kept tight on purpose —
+# this should only catch near-identical frames, not just similar ones.
+DEDUP_SIMILARITY_THRESHOLD = 1.5
 
 # ============================================================
 # Compression levels
@@ -161,7 +163,7 @@ LEVELS: dict[str, dict] = {
 
 LEVEL_ORDER = ["low", "medium", "high", "very_high", "extreme"]
 
-DEFAULT_LEVEL = "high"
+DEFAULT_LEVEL = "medium"
 
 # Per-chat default level, used only to mark which button is
 # starred in the estimate menu.
@@ -174,10 +176,18 @@ chat_default_level: dict[int, str] = {}
 pending_compressions: dict[int, dict] = {}
 PENDING_MAX = 5
 
+# After a PDF is extracted, we deliberately keep the downloaded
+# video around (instead of deleting it right away) so the user can
+# still choose to compress it or auto-delete similar frames. Maps
+# chat_id -> the pending_compressions message_id being held open.
+# It's only torn down when the user sends another video or taps
+# "Finish session" — see clear_pending().
+open_pdf_sessions: dict[int, int] = {}
+
 # Small cache so "redo at a different level" on an already-sent
 # result can re-fetch the source without asking you to resend.
 recent_files: dict[int, dict] = {}
-RECENT_FILES_MAX = 250
+RECENT_FILES_MAX = 200
 
 
 def get_default_level(chat_id: int) -> str:
@@ -202,14 +212,33 @@ def cleanup_work_dir(work_dir: Path) -> None:
         logger.exception("Could not clean temporary files in %s", work_dir)
 
 
+def clear_pending(message_id: int) -> None:
+    """
+    Tear down a pending compression: delete its temp/work dir, drop
+    it from pending_compressions, and close out any open PDF session
+    pointing at it. This is the single place that actually deletes a
+    stored video — call it only when a replacement video has arrived
+    or the user has explicitly finished/cancelled the session.
+    """
+
+    pending = pending_compressions.pop(message_id, None)
+    if pending is not None:
+        cleanup_work_dir(pending["work_dir"])
+
+    stale_chats = [
+        chat_id for chat_id, mid in open_pdf_sessions.items() if mid == message_id
+    ]
+    for chat_id in stale_chats:
+        open_pdf_sessions.pop(chat_id, None)
+
+
 def remember_pending(message_id: int, entry: dict) -> None:
     pending_compressions[message_id] = entry
 
     if len(pending_compressions) > PENDING_MAX:
         oldest_key = next(iter(pending_compressions))
-        oldest = pending_compressions.pop(oldest_key, None)
-        if oldest is not None:
-            cleanup_work_dir(oldest["work_dir"])
+        if oldest_key != message_id:
+            clear_pending(oldest_key)
 
 
 # ============================================================
@@ -331,6 +360,31 @@ def pdf_interval_keyboard(message_id: int) -> InlineKeyboardMarkup:
         row,
         [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")],
     ])
+
+
+def post_pdf_keyboard(message_id: int, dedup_available: bool = True) -> InlineKeyboardMarkup:
+    rows = []
+
+    if dedup_available:
+        rows.append([
+            InlineKeyboardButton(
+                "🧹 Auto-delete similar frames",
+                callback_data=f"pdfdedup:_:{message_id}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton("🗜 Compress video", callback_data=f"pdfcompress:_:{message_id}")
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "✅ Finish session (deletes video)",
+            callback_data=f"pdffinish:_:{message_id}",
+        )
+    ])
+
+    return InlineKeyboardMarkup(rows)
 
 
 def redo_keyboard(message_id: int) -> InlineKeyboardMarkup:
@@ -602,6 +656,77 @@ async def extract_pdf_frames(
     return pdf_path, len(frame_paths), truncated
 
 
+async def compute_frame_signature(frame_path: str) -> bytes | None:
+    """
+    Render a tiny 12x12 grayscale raw-pixel signature for a frame via
+    FFmpeg. Cheap way to compare two frames for near-identity without
+    any extra image-processing dependency.
+    """
+
+    command = [
+        "ffmpeg", "-y",
+        "-i", frame_path,
+        "-vf", "scale=12:12:flags=area,format=gray",
+        "-f", "rawvideo",
+        "-frames:v", "1",
+        "pipe:1",
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+
+    if process.returncode != 0 or not stdout:
+        logger.warning("Frame signature failed for %s", frame_path)
+        return None
+
+    return stdout
+
+
+def frames_are_near_identical(sig_a: bytes, sig_b: bytes, threshold: float) -> bool:
+    if not sig_a or not sig_b or len(sig_a) != len(sig_b):
+        return False
+
+    diff_total = sum(abs(a - b) for a, b in zip(sig_a, sig_b))
+    avg_diff = diff_total / len(sig_a)
+
+    return avg_diff <= threshold
+
+
+async def dedup_frames(
+    frame_paths: list[Path],
+    threshold: float = DEDUP_SIMILARITY_THRESHOLD,
+) -> tuple[list[Path], list[Path]]:
+    """
+    Walk frames in order, dropping any frame that's extremely similar
+    to the last frame that was kept. Returns (kept_paths, removed_paths).
+    """
+
+    kept: list[Path] = []
+    removed: list[Path] = []
+    last_kept_signature: bytes | None = None
+
+    for path in frame_paths:
+        signature = await compute_frame_signature(str(path))
+
+        if (
+            signature is not None
+            and last_kept_signature is not None
+            and frames_are_near_identical(signature, last_kept_signature, threshold)
+        ):
+            removed.append(path)
+            continue
+
+        kept.append(path)
+        if signature is not None:
+            last_kept_signature = signature
+
+    return kept, removed
+
+
 async def estimate_level_size(
     input_path: str,
     duration: float | None,
@@ -733,6 +858,13 @@ async def handle_incoming(
 
     chat_id = message.chat_id
 
+    # A new video replaces whatever we were holding open for a
+    # previous PDF session in this chat — that's the only other
+    # trigger (besides "Finish session") that deletes a stored video.
+    open_session_message_id = open_pdf_sessions.get(chat_id)
+    if open_session_message_id is not None:
+        clear_pending(open_session_message_id)
+
     Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
     work_dir = Path(
@@ -745,7 +877,7 @@ async def handle_incoming(
         size_text = format_size(original_size)
 
         status_message = await message.reply_text(
-            f"📥 Downloading video! ({size_text})..."
+            f"📥 Downloading video ({size_text})..."
         )
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
@@ -797,7 +929,7 @@ async def handle_incoming(
         cleanup_work_dir(work_dir)
         pending_compressions.pop(message.message_id, None)
         await message.reply_text(
-            f"❌ Something went wrong while analyzing the video lol.\n\nError: {error}"
+            f"❌ Something went wrong while analyzing the video.\n\nError: {error}"
         )
 
 
@@ -909,8 +1041,12 @@ async def run_compression(
         )
 
     finally:
-        cleanup_work_dir(work_dir)
-        pending_compressions.pop(source_message_id, None)
+        if source_message_id in pending_compressions:
+            clear_pending(source_message_id)
+        else:
+            # "redo" builds a fresh work_dir that was never registered
+            # in pending_compressions, so just clean it up directly.
+            cleanup_work_dir(work_dir)
 
 
 # ============================================================
@@ -964,7 +1100,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     if not is_video:
-        await message.reply_text("❌ That doesn't look like a video file! هنضحك على بعض؟")
+        await message.reply_text("❌ That doesn't look like a video file.")
         return
 
     remember_file(message.message_id, document.file_id, document.file_size)
@@ -991,7 +1127,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not is_allowed(user_id):
         await query.answer(
-            f"⛔ Not authorized. ask for permission first from the Creator",
+            f"⛔ Not authorized. Your Telegram user ID is {user_id}.",
             show_alert=True,
         )
         return
@@ -1017,9 +1153,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if action == "cancel":
-        pending = pending_compressions.pop(message_id, None)
-        if pending is not None:
-            cleanup_work_dir(pending["work_dir"])
+        clear_pending(message_id)
         await query.edit_message_text("❌ Cancelled — temporary files removed.")
         return
 
@@ -1071,6 +1205,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     chat_id=chat_id,
                     text="❌ Couldn't extract any frames from that video.",
                 )
+                clear_pending(message_id)
                 return
 
             caption = f"📄 {frame_count} frame(s), one every {interval}s."
@@ -1085,17 +1220,137 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 caption=caption,
             )
 
+            # Keep the downloaded video (and its work_dir) around —
+            # the user can still auto-delete similar frames or jump
+            # into compression. It's only deleted if another video
+            # arrives or they tap "Finish session".
+            pending["interval"] = interval
+            pending["frames_dir"] = str(work_dir / "frames")
+            open_pdf_sessions[chat_id] = message_id
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="What would you like to do next?",
+                reply_markup=post_pdf_keyboard(message_id, dedup_available=frame_count > 1),
+            )
+
         except Exception as error:
             logger.exception("Error extracting PDF:")
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"❌ Something went wrong extracting frames.\n\nError: {error}",
             )
+            clear_pending(message_id)
 
-        finally:
-            cleanup_work_dir(work_dir)
-            pending_compressions.pop(message_id, None)
+        return
 
+    if action == "pdfdedup":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        frames_dir = pending.get("frames_dir")
+
+        if not frames_dir:
+            await query.message.reply_text(
+                "⚠️ No extracted frames to compare yet — extract a PDF first."
+            )
+            return
+
+        frame_paths = sorted(Path(frames_dir).glob("frame_*.jpg"))
+
+        if len(frame_paths) < 2:
+            await query.answer("Nothing to compare — not enough frames.", show_alert=True)
+            return
+
+        chat_id = pending["chat_id"]
+
+        await query.edit_message_text("🔍 Comparing frames for near-duplicates...")
+
+        try:
+            kept_paths, removed_paths = await dedup_frames(frame_paths)
+
+            if not removed_paths:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="✅ No extremely-similar frames found — nothing removed.",
+                    reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
+                )
+                return
+
+            for path in removed_paths:
+                path.unlink(missing_ok=True)
+
+            work_dir = pending["work_dir"]
+            pdf_path = Path(work_dir) / "frames.pdf"
+            pdf_bytes = img2pdf.convert([str(path) for path in kept_paths])
+            pdf_path.write_bytes(pdf_bytes)
+
+            await with_retries(
+                context.bot.send_document,
+                chat_id=chat_id,
+                document=str(pdf_path),
+                filename="frames_deduped.pdf",
+                caption=(
+                    f"🧹 Removed {len(removed_paths)} near-duplicate frame(s) — "
+                    f"{len(kept_paths)} remain."
+                ),
+                reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
+            )
+
+        except Exception as error:
+            logger.exception("Error deduplicating frames:")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Something went wrong removing similar frames.\n\nError: {error}",
+            )
+
+        return
+
+    if action == "pdfcompress":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        chat_id = pending["chat_id"]
+
+        await query.edit_message_text("🔎 Estimating size at each compression level...")
+
+        estimates = await estimate_all_levels(str(input_path), duration, work_dir)
+        default_level = get_default_level(chat_id)
+
+        lines = [f"Original size: {format_size(pending['original_size'])}", ""]
+        for level_key in LEVEL_ORDER:
+            info = LEVELS[level_key]
+            est = estimates.get(level_key)
+            lines.append(f"{info['label']} — ~{format_size(est)} · {info['detail']}")
+
+        lines.append("")
+        lines.append("Estimates are based on a short sample and may vary ±15%.")
+        lines.append("Pick a level to compress:")
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=estimate_keyboard(message_id, estimates, default_level),
+        )
+        return
+
+    if action == "pdffinish":
+        clear_pending(message_id)
+        await query.edit_message_text(
+            "✅ Session finished — the stored video and temporary files were deleted."
+        )
         return
 
     if level not in LEVELS:
