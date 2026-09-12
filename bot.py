@@ -46,7 +46,14 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
 ALLOWED_USER_IDS: set[int] = {
     940770584,
    5879238618,
-   6608494574, # <- replace with your Telegram user ID
+   6608494574,
+    6651204891,
+    1194780815,
+    5879238618,
+    2112316128,
+    7504848343,
+    5131223597,
+    # <- replace with your Telegram user ID
     # 222222222,  # <- add more IDs here if needed
 }
 
