@@ -103,6 +103,17 @@ PDF_INTERVALS = [15, 30, 45, 60]  # seconds
 # produce a very large PDF (and take a while for img2pdf to build),
 # but nothing gets silently dropped anymore.
 
+# "Auto-detect changes" mode: sample the video at a fine, fixed
+# granularity, then run the same auto-threshold dedup used elsewhere
+# to keep only frames that actually changed — no fixed interval to
+# pick at all. SMART_CAPTURE_BASE_INTERVAL is the finest we'll ever
+# sample at. SMART_CAPTURE_MAX_CANDIDATES caps how many raw candidate
+# frames get extracted+compared regardless of video length (each one
+# costs an FFmpeg call), by widening the sampling interval for long
+# videos instead of scanning e.g. an hour-long video at 2s resolution.
+SMART_CAPTURE_BASE_INTERVAL = float(os.getenv("SMART_CAPTURE_BASE_INTERVAL", "5"))
+SMART_CAPTURE_MAX_CANDIDATES = int(os.getenv("SMART_CAPTURE_MAX_CANDIDATES", "900"))
+
 # How close two frames' 24x24 grayscale signatures must be to count
 # as "extremely similar" for the auto-delete-similar-frames step.
 # This is the WORST single-cell difference (0-255 scale), not an
@@ -397,6 +408,7 @@ def pdf_interval_keyboard(message_id: int) -> InlineKeyboardMarkup:
         for seconds in PDF_INTERVALS
     ]
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧠 Auto-detect changes", callback_data=f"pdfauto:_:{message_id}")],
         row,
         [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")],
     ])
@@ -580,24 +592,18 @@ def build_ffmpeg_command(
     return command
 
 
-async def compress_video(
-    input_path: str,
-    output_path: str,
-    level: str,
+async def run_ffmpeg_with_progress(
+    command: list[str],
     total_duration: float | None = None,
     progress_callback=None,
 ) -> None:
     """
-    Compress a video with FFmpeg. If total_duration and a
-    progress_callback are supplied, streams real encode progress
-    (based on how much of the video's timeline has been processed)
-    to the callback as it happens.
+    Runs an FFmpeg command that was built with `-progress pipe:1`
+    enabled, streaming real progress (how much of the video's
+    timeline has been processed) to progress_callback as it happens.
+    Shared by any FFmpeg step that wants a progress bar — compression,
+    frame extraction, etc. Raises RuntimeError if FFmpeg exits non-zero.
     """
-
-    settings = LEVELS[level]
-    command = build_ffmpeg_command(input_path, output_path, settings, enable_progress=True)
-
-    logger.info("Running FFmpeg (%s): %s", level, " ".join(command))
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -646,19 +652,78 @@ async def compress_video(
         logger.error("FFmpeg failed:\n%s", error)
         raise RuntimeError(f"FFmpeg failed with exit code {returncode}")
 
+
+def make_progress_editor(status_message, label: str):
+    """
+    Returns an async progress_callback(percent) that edits
+    status_message to show `label` plus a progress bar, throttled the
+    same way the compression progress bar is (so it doesn't hammer
+    Telegram's rate limit).
+    """
+
+    state = {"last_percent": -10.0, "last_edit": 0.0}
+
+    async def callback(percent: float) -> None:
+        now = time.monotonic()
+
+        if (
+            percent - state["last_percent"] < 4
+            and now - state["last_edit"] < 3
+            and percent < 100
+        ):
+            return
+
+        state["last_percent"] = percent
+        state["last_edit"] = now
+
+        try:
+            await status_message.edit_text(f"{label}\n{render_progress_bar(percent)}")
+        except Exception:
+            # A rate-limit hiccup or "message not modified" here
+            # shouldn't abort the underlying work.
+            pass
+
+    return callback
+
+
+async def compress_video(
+    input_path: str,
+    output_path: str,
+    level: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+) -> None:
+    """
+    Compress a video with FFmpeg. If total_duration and a
+    progress_callback are supplied, streams real encode progress
+    (based on how much of the video's timeline has been processed)
+    to the callback as it happens.
+    """
+
+    settings = LEVELS[level]
+    command = build_ffmpeg_command(input_path, output_path, settings, enable_progress=True)
+
+    logger.info("Running FFmpeg (%s): %s", level, " ".join(command))
+
+    await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+
     logger.info("FFmpeg compression completed.")
 
 
-async def extract_pdf_frames(
+async def extract_frames_at_interval(
     input_path: str,
     work_dir: Path,
-    interval: int,
-) -> tuple[Path | None, int]:
+    interval: float,
+    total_duration: float | None = None,
+    progress_callback=None,
+) -> list[Path]:
     """
-    Grab one frame every `interval` seconds and combine them into a
-    single PDF (one frame per page). Returns (pdf_path, frame_count) —
-    pdf_path is None if extraction failed outright. No cap on frame
-    count: a long video at a short interval will produce a large PDF.
+    Grab one frame every `interval` seconds. Returns the sorted list
+    of extracted frame paths (empty list on failure). No cap on frame
+    count — a short interval on a long video will extract a lot of
+    frames. If total_duration and progress_callback are given, streams
+    extraction progress (how much of the video's timeline has been
+    scanned) to the callback.
     """
 
     frames_dir = work_dir / "frames"
@@ -666,21 +731,40 @@ async def extract_pdf_frames(
 
     pattern = str(frames_dir / "frame_%04d.jpg")
 
-    command = [
-        "ffmpeg", "-y",
+    command = ["ffmpeg", "-y"]
+
+    if progress_callback is not None and total_duration:
+        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    command += [
         "-i", input_path,
         "-vf", f"fps=1/{interval}",
         "-q:v", "3",
         pattern,
     ]
 
-    returncode, stdout, stderr = await run_command(command)
+    try:
+        await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+    except RuntimeError:
+        logger.error("PDF frame extraction failed.")
+        return []
 
-    if returncode != 0:
-        logger.error("PDF frame extraction failed:\n%s", stderr.decode(errors="replace"))
-        return None, 0
+    return sorted(frames_dir.glob("frame_*.jpg"))
 
-    frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
+
+async def extract_pdf_frames(
+    input_path: str,
+    work_dir: Path,
+    interval: float,
+) -> tuple[Path | None, int]:
+    """
+    Fixed-interval capture: extract frames every `interval` seconds
+    and combine them all into a single PDF (one frame per page).
+    Returns (pdf_path, frame_count) — pdf_path is None if extraction
+    failed outright.
+    """
+
+    frame_paths = await extract_frames_at_interval(input_path, work_dir, interval)
 
     if not frame_paths:
         return None, 0
@@ -804,6 +888,7 @@ def compute_auto_threshold(diffs: list[int]) -> float:
 async def dedup_frames(
     frame_paths: list[Path],
     threshold: float | None = None,
+    progress_callback=None,
 ) -> tuple[list[Path], list[Path], float]:
     """
     Walk frames in order, dropping any frame that's extremely similar
@@ -811,17 +896,24 @@ async def dedup_frames(
     case), one is computed automatically for this specific video via
     compute_auto_threshold. Returns (kept_paths, removed_paths,
     threshold_used) — the threshold is returned so it can be shown to
-    the user for transparency/sanity-checking.
+    the user for transparency/sanity-checking. If progress_callback is
+    given, it's called with 0-100 as frame signatures are computed.
     """
 
     if len(frame_paths) < 2:
         return list(frame_paths), [], threshold if threshold is not None else DEDUP_SIMILARITY_THRESHOLD
 
     signature_semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+    completed = 0
 
     async def bounded_signature(path: Path) -> bytes | None:
+        nonlocal completed
         async with signature_semaphore:
-            return await compute_frame_signature(str(path))
+            result = await compute_frame_signature(str(path))
+        completed += 1
+        if progress_callback is not None:
+            await progress_callback(completed / len(frame_paths) * 100)
+        return result
 
     signatures = await asyncio.gather(*(bounded_signature(path) for path in frame_paths))
 
@@ -1404,6 +1496,101 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"❌ Something went wrong extracting frames.\n\nError: {error}",
+            )
+            clear_pending(message_id)
+
+        return
+
+    if action == "pdfauto":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        status_message = query.message
+
+        # Widen the sampling interval for long videos so we never
+        # extract+compare more than SMART_CAPTURE_MAX_CANDIDATES raw
+        # frames, regardless of how long the video is.
+        interval = SMART_CAPTURE_BASE_INTERVAL
+        if duration:
+            interval = max(SMART_CAPTURE_BASE_INTERVAL, duration / SMART_CAPTURE_MAX_CANDIDATES)
+
+        scan_label = f"📸 Scanning the video for changes (sampling every {interval:.1f}s)..."
+        await status_message.edit_text(f"{scan_label}\n{render_progress_bar(0)}")
+
+        try:
+            candidate_paths = await extract_frames_at_interval(
+                str(input_path),
+                work_dir,
+                interval,
+                total_duration=duration,
+                progress_callback=make_progress_editor(status_message, scan_label),
+            )
+
+            if not candidate_paths:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Couldn't extract any frames from that video.",
+                )
+                clear_pending(message_id)
+                return
+
+            compare_label = f"🔍 Sampled {len(candidate_paths)} frame(s) — comparing for real changes..."
+            await status_message.edit_text(f"{compare_label}\n{render_progress_bar(0)}")
+
+            kept_paths, removed_paths, threshold_used = await dedup_frames(
+                candidate_paths,
+                progress_callback=make_progress_editor(status_message, compare_label),
+            )
+
+            for path in removed_paths:
+                path.unlink(missing_ok=True)
+
+            pdf_path = work_dir / "frames.pdf"
+            pdf_bytes = img2pdf.convert([str(path) for path in kept_paths])
+            pdf_path.write_bytes(pdf_bytes)
+
+            caption = (
+                f"📄 {len(kept_paths)} frame(s) kept out of {len(candidate_paths)} sampled "
+                f"(every {interval:.1f}s).\n"
+                f"(auto threshold: {threshold_used:.0f})"
+            )
+
+            await with_retries(
+                context.bot.send_document,
+                chat_id=chat_id,
+                document=str(pdf_path),
+                filename="frames.pdf",
+                caption=caption,
+            )
+
+            # Keep the downloaded video (and its work_dir) around —
+            # the user can still auto-delete similar frames or jump
+            # into compression. It's only deleted if another video
+            # arrives or they tap "Finish session".
+            pending["interval"] = interval
+            pending["frames_dir"] = str(work_dir / "frames")
+            open_pdf_sessions[chat_id] = message_id
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="What would you like to do next?",
+                reply_markup=post_pdf_keyboard(message_id, dedup_available=len(kept_paths) > 1),
+            )
+
+        except Exception as error:
+            logger.exception("Error during smart PDF capture:")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Something went wrong scanning the video.\n\nError: {error}",
             )
             clear_pending(message_id)
 
