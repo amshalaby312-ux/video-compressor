@@ -87,17 +87,29 @@ FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "2")
 # caps it so the estimate phase stays within tight resource limits.
 ESTIMATE_CONCURRENCY = int(os.getenv("ESTIMATE_CONCURRENCY", "2"))
 
+# How many actual compressions (not estimates) are allowed to run at
+# once. Railway's trial/free tiers give you one shared vCPU, so two
+# full FFmpeg encodes at the same time don't run in parallel so much
+# as fight each other and both go slower. Extra requests queue up
+# and run one at a time instead. Raise this only if you've upgraded
+# to more CPU.
+MAX_CONCURRENT_COMPRESSIONS = int(os.getenv("MAX_CONCURRENT_COMPRESSIONS", "1"))
+
 # ------------------------------------------------------------
 # PDF frame-extraction mode
 # ------------------------------------------------------------
 PDF_INTERVALS = [15, 30, 45, 60]  # seconds
-PDF_MAX_FRAMES = 200  # safety cap so a long video can't produce a huge PDF
+# No cap on frame count — a long video at a short interval can
+# produce a very large PDF (and take a while for img2pdf to build),
+# but nothing gets silently dropped anymore.
 
-# How close two frames' tiny grayscale signatures must be (average
-# per-pixel difference, 0-255 scale) to count as "extremely similar"
-# for the auto-delete-similar-frames step. Kept tight on purpose —
-# this should only catch near-identical frames, not just similar ones.
-DEDUP_SIMILARITY_THRESHOLD = 1.5
+# How close two frames' 24x24 grayscale signatures must be to count
+# as "extremely similar" for the auto-delete-similar-frames step.
+# This is the WORST single-cell difference (0-255 scale), not an
+# average — see frames_are_near_identical. A low value means even one
+# badly-differing patch of the frame (a subtitle, a small motion,
+# anything localized) is enough to call the frames different.
+DEDUP_SIMILARITY_THRESHOLD = 10
 
 # ============================================================
 # Compression levels
@@ -197,6 +209,13 @@ open_pdf_sessions: dict[int, int] = {}
 # result can re-fetch the source without asking you to resend.
 recent_files: dict[int, dict] = {}
 RECENT_FILES_MAX = 200
+
+# Serializes actual FFmpeg compression jobs (see MAX_CONCURRENT_COMPRESSIONS
+# above). active_compressions is just a plain counter used to word the
+# "you're queued" message — safe as a bare int since everything here runs
+# on the single asyncio event loop, no separate threads involved.
+compression_semaphore = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
+active_compressions = 0
 
 
 def get_default_level(chat_id: int) -> str:
@@ -325,6 +344,18 @@ def format_size(size: float | None) -> str:
         value /= 1024
 
     return f"{value:.1f} PB"
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
 
 
 def get_video_filter(max_width: int) -> str:
@@ -622,12 +653,12 @@ async def extract_pdf_frames(
     input_path: str,
     work_dir: Path,
     interval: int,
-    max_frames: int = PDF_MAX_FRAMES,
-) -> tuple[Path | None, int, bool]:
+) -> tuple[Path | None, int]:
     """
     Grab one frame every `interval` seconds and combine them into a
-    single PDF (one frame per page). Returns (pdf_path, frame_count,
-    was_truncated) — pdf_path is None if extraction failed outright.
+    single PDF (one frame per page). Returns (pdf_path, frame_count) —
+    pdf_path is None if extraction failed outright. No cap on frame
+    count: a long video at a short interval will produce a large PDF.
     """
 
     frames_dir = work_dir / "frames"
@@ -647,35 +678,35 @@ async def extract_pdf_frames(
 
     if returncode != 0:
         logger.error("PDF frame extraction failed:\n%s", stderr.decode(errors="replace"))
-        return None, 0, False
+        return None, 0
 
     frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
 
     if not frame_paths:
-        return None, 0, False
-
-    truncated = len(frame_paths) > max_frames
-    frame_paths = frame_paths[:max_frames]
+        return None, 0
 
     pdf_path = work_dir / "frames.pdf"
 
     pdf_bytes = img2pdf.convert([str(path) for path in frame_paths])
     pdf_path.write_bytes(pdf_bytes)
 
-    return pdf_path, len(frame_paths), truncated
+    return pdf_path, len(frame_paths)
 
 
 async def compute_frame_signature(frame_path: str) -> bytes | None:
     """
-    Render a tiny 12x12 grayscale raw-pixel signature for a frame via
+    Render a tiny grayscale raw-pixel signature for a frame via
     FFmpeg. Cheap way to compare two frames for near-identity without
-    any extra image-processing dependency.
+    any extra image-processing dependency. Grid is 24x24 (was 12x12) —
+    more sample points makes the comparison more sensitive to real
+    differences between frames, so visually-different frames are less
+    likely to get averaged down into looking "near-identical".
     """
 
     command = [
         "ffmpeg", "-y",
         "-i", frame_path,
-        "-vf", "scale=12:12:flags=area,format=gray",
+        "-vf", "scale=24:24:flags=area,format=gray",
         "-f", "rawvideo",
         "-frames:v", "1",
         "pipe:1",
@@ -695,32 +726,121 @@ async def compute_frame_signature(frame_path: str) -> bytes | None:
     return stdout
 
 
-def frames_are_near_identical(sig_a: bytes, sig_b: bytes, threshold: float) -> bool:
+def signature_diff(sig_a: bytes | None, sig_b: bytes | None) -> int | None:
+    """Worst (max) single-cell difference between two frame signatures, or None if either is missing/mismatched."""
+
     if not sig_a or not sig_b or len(sig_a) != len(sig_b):
-        return False
+        return None
 
-    diff_total = sum(abs(a - b) for a, b in zip(sig_a, sig_b))
-    avg_diff = diff_total / len(sig_a)
+    return max(abs(a - b) for a, b in zip(sig_a, sig_b))
 
-    return avg_diff <= threshold
+
+def frames_are_near_identical(sig_a: bytes, sig_b: bytes, threshold: float) -> bool:
+    """
+    Compares the two frames' grids cell-by-cell and looks at the
+    WORST (max) cell difference, not the average. Averaging washes
+    out localized change — a subtitle or small motion in one corner
+    barely moves an average over 576 cells — so a single badly-
+    differing region is enough to call the frames different, even if
+    the rest of the frame is identical.
+    """
+
+    diff = signature_diff(sig_a, sig_b)
+    return diff is not None and diff <= threshold
+
+
+def compute_auto_threshold(diffs: list[int]) -> float:
+    """
+    Finds the natural split point between "small" (likely duplicate)
+    and "large" (likely real content change) frame-to-frame diffs, so
+    the dedup threshold adapts to how static or noisy THIS video is
+    instead of using one fixed number for every video.
+
+    Simple 1D clustering (an Otsu-style search): tries every possible
+    split point between the observed diff values, and keeps the split
+    that best separates them into a "low" group and a "high" group
+    (maximizes the gap between the two groups' averages, weighted by
+    how many diffs fall on each side). That split point becomes the
+    threshold. Falls back to DEDUP_SIMILARITY_THRESHOLD if there isn't
+    enough data to find a meaningful split.
+    """
+
+    if len(diffs) < 4:
+        return DEDUP_SIMILARITY_THRESHOLD
+
+    candidates = sorted(set(diffs))
+
+    if len(candidates) < 2:
+        return DEDUP_SIMILARITY_THRESHOLD
+
+    best_split = None
+    best_score = -1.0
+
+    for i in range(len(candidates) - 1):
+        split = (candidates[i] + candidates[i + 1]) / 2
+        low = [d for d in diffs if d <= split]
+        high = [d for d in diffs if d > split]
+
+        if not low or not high:
+            continue
+
+        weight_low = len(low) / len(diffs)
+        weight_high = len(high) / len(diffs)
+        mean_low = sum(low) / len(low)
+        mean_high = sum(high) / len(high)
+
+        # Between-group variance — bigger when the two groups are both
+        # sizeable AND far apart, which is what a clean "duplicates vs
+        # real changes" split looks like.
+        score = weight_low * weight_high * (mean_high - mean_low) ** 2
+
+        if score > best_score:
+            best_score = score
+            best_split = split
+
+    return best_split if best_split is not None else DEDUP_SIMILARITY_THRESHOLD
 
 
 async def dedup_frames(
     frame_paths: list[Path],
-    threshold: float = DEDUP_SIMILARITY_THRESHOLD,
-) -> tuple[list[Path], list[Path]]:
+    threshold: float | None = None,
+) -> tuple[list[Path], list[Path], float]:
     """
     Walk frames in order, dropping any frame that's extremely similar
-    to the last frame that was kept. Returns (kept_paths, removed_paths).
+    to the last frame that was kept. If threshold is None (the normal
+    case), one is computed automatically for this specific video via
+    compute_auto_threshold. Returns (kept_paths, removed_paths,
+    threshold_used) — the threshold is returned so it can be shown to
+    the user for transparency/sanity-checking.
     """
+
+    if len(frame_paths) < 2:
+        return list(frame_paths), [], threshold if threshold is not None else DEDUP_SIMILARITY_THRESHOLD
+
+    signature_semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+
+    async def bounded_signature(path: Path) -> bytes | None:
+        async with signature_semaphore:
+            return await compute_frame_signature(str(path))
+
+    signatures = await asyncio.gather(*(bounded_signature(path) for path in frame_paths))
+
+    if threshold is None:
+        adjacent_diffs = [
+            diff
+            for diff in (
+                signature_diff(signatures[i], signatures[i + 1])
+                for i in range(len(signatures) - 1)
+            )
+            if diff is not None
+        ]
+        threshold = compute_auto_threshold(adjacent_diffs)
 
     kept: list[Path] = []
     removed: list[Path] = []
     last_kept_signature: bytes | None = None
 
-    for path in frame_paths:
-        signature = await compute_frame_signature(str(path))
-
+    for path, signature in zip(frame_paths, signatures):
         if (
             signature is not None
             and last_kept_signature is not None
@@ -733,7 +853,7 @@ async def dedup_frames(
         if signature is not None:
             last_kept_signature = signature
 
-    return kept, removed
+    return kept, removed, threshold
 
 
 async def estimate_level_size(
@@ -954,53 +1074,91 @@ async def run_compression(
     status_message=None,
     duration: float | None = None,
 ) -> None:
+    global active_compressions
+
     level_info = LEVELS[level]
     output_path = work_dir / "compressed.mp4"
 
     try:
-        text = f"⚙️ Compressing at {level_info['label']}...\n{render_progress_bar(0)}"
+        # Queue: only MAX_CONCURRENT_COMPRESSIONS compressions actually
+        # encode at once. If others are already running, say so up
+        # front instead of leaving the user staring at 0%.
+        if active_compressions >= MAX_CONCURRENT_COMPRESSIONS:
+            queue_text = (
+                f"🕓 {active_compressions} compression(s) already in progress — "
+                "you're queued and will start automatically..."
+            )
+            if status_message is not None:
+                await with_retries(status_message.edit_text, queue_text)
+            else:
+                status_message = await with_retries(
+                    context.bot.send_message, chat_id=chat_id, text=queue_text
+                )
 
-        if status_message is not None:
-            await with_retries(status_message.edit_text, text)
-        else:
-            status_message = await with_retries(context.bot.send_message, chat_id=chat_id, text=text)
-
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-
-        progress_state = {"last_percent": -10.0, "last_edit": 0.0}
-
-        async def on_progress(percent: float) -> None:
-            now = time.monotonic()
-
-            # Throttle edits so we don't hammer Telegram's rate limit —
-            # only push an update on a meaningful jump or after a
-            # few seconds, whichever comes first.
-            if (
-                percent - progress_state["last_percent"] < 4
-                and now - progress_state["last_edit"] < 3
-                and percent < 100
-            ):
-                return
-
-            progress_state["last_percent"] = percent
-            progress_state["last_edit"] = now
-
-            bar_text = f"⚙️ Compressing at {level_info['label']}...\n{render_progress_bar(percent)}"
-
+        async with compression_semaphore:
+            active_compressions += 1
             try:
-                await status_message.edit_text(bar_text)
-            except Exception:
-                # A rate-limit hiccup or "message not modified" here
-                # shouldn't abort the actual compression.
-                pass
+                text = f"⚙️ Compressing at {level_info['label']}...\n{render_progress_bar(0)}"
 
-        await compress_video(
-            str(input_path),
-            str(output_path),
-            level,
-            total_duration=duration,
-            progress_callback=on_progress if duration else None,
-        )
+                if status_message is not None:
+                    await with_retries(status_message.edit_text, text)
+                else:
+                    status_message = await with_retries(context.bot.send_message, chat_id=chat_id, text=text)
+
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+                progress_state = {
+                    "last_percent": -10.0,
+                    "last_edit": 0.0,
+                    "start_time": time.monotonic(),
+                }
+
+                async def on_progress(percent: float) -> None:
+                    now = time.monotonic()
+
+                    # Throttle edits so we don't hammer Telegram's rate limit —
+                    # only push an update on a meaningful jump or after a
+                    # few seconds, whichever comes first.
+                    if (
+                        percent - progress_state["last_percent"] < 4
+                        and now - progress_state["last_edit"] < 3
+                        and percent < 100
+                    ):
+                        return
+
+                    progress_state["last_percent"] = percent
+                    progress_state["last_edit"] = now
+
+                    elapsed = now - progress_state["start_time"]
+                    eta_text = ""
+                    # Need a little progress before the elapsed/percent
+                    # ratio means anything — otherwise early jitter
+                    # produces a wildly wrong estimate.
+                    if 1 <= percent < 100 and elapsed > 2:
+                        remaining_seconds = elapsed * (100 - percent) / percent
+                        eta_text = f" · ~{format_duration(remaining_seconds)} left"
+
+                    bar_text = (
+                        f"⚙️ Compressing at {level_info['label']}...\n"
+                        f"{render_progress_bar(percent)}{eta_text}"
+                    )
+
+                    try:
+                        await status_message.edit_text(bar_text)
+                    except Exception:
+                        # A rate-limit hiccup or "message not modified" here
+                        # shouldn't abort the actual compression.
+                        pass
+
+                await compress_video(
+                    str(input_path),
+                    str(output_path),
+                    level,
+                    total_duration=duration,
+                    progress_callback=on_progress if duration else None,
+                )
+            finally:
+                active_compressions -= 1
 
         compressed_size = output_path.stat().st_size
 
@@ -1205,7 +1363,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
         try:
-            pdf_path, frame_count, truncated = await extract_pdf_frames(
+            pdf_path, frame_count = await extract_pdf_frames(
                 str(input_path), work_dir, interval
             )
 
@@ -1218,8 +1376,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
 
             caption = f"📄 {frame_count} frame(s), one every {interval}s."
-            if truncated:
-                caption += f"\n⚠️ Capped at {PDF_MAX_FRAMES} frames to keep the PDF a reasonable size."
 
             await with_retries(
                 context.bot.send_document,
@@ -1281,12 +1437,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("🔍 Comparing frames for near-duplicates...")
 
         try:
-            kept_paths, removed_paths = await dedup_frames(frame_paths)
+            kept_paths, removed_paths, threshold_used = await dedup_frames(frame_paths)
 
             if not removed_paths:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="✅ No extremely-similar frames found — nothing removed.",
+                    text=(
+                        "✅ No extremely-similar frames found — nothing removed.\n"
+                        f"(auto threshold: {threshold_used:.0f})"
+                    ),
                     reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
                 )
                 return
@@ -1306,7 +1465,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 filename="frames_deduped.pdf",
                 caption=(
                     f"🧹 Removed {len(removed_paths)} near-duplicate frame(s) — "
-                    f"{len(kept_paths)} remain."
+                    f"{len(kept_paths)} remain.\n"
+                    f"(auto threshold: {threshold_used:.0f})"
                 ),
                 reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
             )
