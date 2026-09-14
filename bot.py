@@ -197,6 +197,25 @@ LEVEL_ORDER = ["low", "medium", "high", "very_high", "extreme"]
 
 DEFAULT_LEVEL = "medium"
 
+# ============================================================
+# Audio quality + volume boost (chosen after the video level)
+# ============================================================
+
+AUDIO_LEVELS: dict[str, dict] = {
+    "low": {"label": "🔈 Low", "detail": "Smallest audio, noticeable quality loss", "bitrate": "48k"},
+    "medium": {"label": "🔉 Medium", "detail": "Balanced", "bitrate": "96k"},
+    "high": {"label": "🔊 High", "detail": "Best quality, biggest audio", "bitrate": "160k"},
+}
+
+AUDIO_LEVEL_ORDER = ["low", "medium", "high"]
+
+DEFAULT_AUDIO_LEVEL = "medium"
+
+# Volume boost is intentionally limited to these three fixed steps
+# (plus "no boost") rather than a free-form percentage — keeps the
+# button row small and avoids people cranking it into clipping.
+VOLUME_BOOST_OPTIONS = [0, 20, 40, 60]  # percent
+
 # Per-chat default level, used only to mark which button is
 # starred in the estimate menu.
 chat_default_level: dict[int, str] = {}
@@ -373,6 +392,23 @@ def get_video_filter(max_width: int) -> str:
     return f"scale='min({max_width},iw)':-2"
 
 
+def estimate_audio_bytes(bitrate: str, duration: float | None) -> int | None:
+    """
+    Audio is encoded at a constant target bitrate (-b:a), so its size
+    is just bitrate * duration — no sample encode needed, unlike video.
+    """
+
+    if not duration or duration <= 0:
+        return None
+
+    try:
+        kbps = int(bitrate.rstrip("k"))
+    except ValueError:
+        return None
+
+    return int(kbps * 1000 * duration / 8)
+
+
 def estimate_keyboard(message_id: int, estimates: dict[str, int | None], highlight: str | None) -> InlineKeyboardMarkup:
     rows = []
 
@@ -400,6 +436,51 @@ def estimate_keyboard(message_id: int, estimates: dict[str, int | None], highlig
     ])
 
     return InlineKeyboardMarkup(rows)
+
+
+def audio_keyboard(
+    message_id: int,
+    level: str,
+    estimates: dict[str, int | None],
+    highlight: str,
+) -> InlineKeyboardMarkup:
+    rows = []
+
+    for audio_level in AUDIO_LEVEL_ORDER:
+        info = AUDIO_LEVELS[audio_level]
+        size_text = format_size(estimates.get(audio_level))
+        text = f"{info['label']} — ~{size_text} · {info['detail']}"
+
+        if audio_level == highlight:
+            text = f"✅ {text}"
+
+        rows.append([
+            InlineKeyboardButton(
+                text,
+                callback_data=f"audioset:{level}|{audio_level}:{message_id}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def volume_keyboard(message_id: int, level: str, audio_level: str) -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton(
+            "🔈 No boost" if boost == 0 else f"🔊 +{boost}%",
+            callback_data=f"volumeset:{level}|{audio_level}|{boost}:{message_id}",
+        )
+        for boost in VOLUME_BOOST_OPTIONS
+    ]
+
+    return InlineKeyboardMarkup([
+        row,
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")],
+    ])
 
 
 def pdf_interval_keyboard(message_id: int) -> InlineKeyboardMarkup:
@@ -550,6 +631,8 @@ def build_ffmpeg_command(
     seek: float | None = None,
     duration: float | None = None,
     enable_progress: bool = False,
+    audio_bitrate: str | None = None,
+    volume_boost_percent: int = 0,
 ) -> list[str]:
     command = ["ffmpeg", "-y"]
 
@@ -580,7 +663,14 @@ def build_ffmpeg_command(
         "-threads", FFMPEG_THREADS,
         "-vf", get_video_filter(settings["max_width"]),
         "-c:a", "aac",
-        "-b:a", settings["audio_bitrate"],
+        "-b:a", audio_bitrate or settings["audio_bitrate"],
+    ]
+
+    if volume_boost_percent:
+        # e.g. +20% -> volume=1.20
+        command += ["-af", f"volume={1 + volume_boost_percent / 100:.2f}"]
+
+    command += [
         "-movflags", "+faststart",
         # Prevents an abrupt "Conversion failed!" at finalization if
         # the muxer's internal packet queue backs up on a tight
@@ -692,16 +782,27 @@ async def compress_video(
     level: str,
     total_duration: float | None = None,
     progress_callback=None,
+    audio_bitrate: str | None = None,
+    volume_boost_percent: int = 0,
 ) -> None:
     """
     Compress a video with FFmpeg. If total_duration and a
     progress_callback are supplied, streams real encode progress
     (based on how much of the video's timeline has been processed)
-    to the callback as it happens.
+    to the callback as it happens. audio_bitrate overrides the
+    level's default audio bitrate if given; volume_boost_percent
+    applies a volume filter on top (0 = no change).
     """
 
     settings = LEVELS[level]
-    command = build_ffmpeg_command(input_path, output_path, settings, enable_progress=True)
+    command = build_ffmpeg_command(
+        input_path,
+        output_path,
+        settings,
+        enable_progress=True,
+        audio_bitrate=audio_bitrate,
+        volume_boost_percent=volume_boost_percent,
+    )
 
     logger.info("Running FFmpeg (%s): %s", level, " ".join(command))
 
@@ -1125,6 +1226,7 @@ async def handle_incoming(
                 "filename": filename,
                 "chat_id": chat_id,
                 "duration": duration,
+                "estimates": estimates,
             },
         )
 
@@ -1165,10 +1267,14 @@ async def run_compression(
     source_message_id: int,
     status_message=None,
     duration: float | None = None,
+    audio_level: str = DEFAULT_AUDIO_LEVEL,
+    volume_boost_percent: int = 0,
 ) -> None:
     global active_compressions
 
     level_info = LEVELS[level]
+    audio_info = AUDIO_LEVELS[audio_level]
+    audio_bitrate = audio_info["bitrate"]
     output_path = work_dir / "compressed.mp4"
 
     try:
@@ -1190,7 +1296,12 @@ async def run_compression(
         async with compression_semaphore:
             active_compressions += 1
             try:
-                text = f"⚙️ Compressing at {level_info['label']}...\n{render_progress_bar(0)}"
+                boost_suffix = f" · 🔊+{volume_boost_percent}%" if volume_boost_percent else ""
+                compressing_label = (
+                    f"⚙️ Compressing at {level_info['label']} "
+                    f"(audio: {audio_info['label']}{boost_suffix})..."
+                )
+                text = f"{compressing_label}\n{render_progress_bar(0)}"
 
                 if status_message is not None:
                     await with_retries(status_message.edit_text, text)
@@ -1231,7 +1342,7 @@ async def run_compression(
                         eta_text = f" · ~{format_duration(remaining_seconds)} left"
 
                     bar_text = (
-                        f"⚙️ Compressing at {level_info['label']}...\n"
+                        f"{compressing_label}\n"
                         f"{render_progress_bar(percent)}{eta_text}"
                     )
 
@@ -1248,6 +1359,8 @@ async def run_compression(
                     level,
                     total_duration=duration,
                     progress_callback=on_progress if duration else None,
+                    audio_bitrate=audio_bitrate,
+                    volume_boost_percent=volume_boost_percent,
                 )
             finally:
                 active_compressions -= 1
@@ -1284,7 +1397,7 @@ async def run_compression(
             duration=round(output_duration) if output_duration else None,
             thumbnail=str(thumbnail_path) if has_thumbnail else None,
             caption=(
-                f"✅ Compression complete! ({level_info['label']})\n\n"
+                f"✅ Compression complete! ({level_info['label']}, audio: {audio_info['label']}{boost_suffix})\n\n"
                 f"Original: {format_size(original_size)}\n"
                 f"Compressed: {format_size(compressed_size)}\n"
                 f"Saved: {percentage:.1f}%"
@@ -1684,6 +1797,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("🔎 Estimating size at each compression level...")
 
         estimates = await estimate_all_levels(str(input_path), duration, work_dir)
+        pending["estimates"] = estimates
         default_level = get_default_level(chat_id)
 
         lines = [f"Original size: {format_size(pending['original_size'])}", ""]
@@ -1709,10 +1823,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    if level not in LEVELS:
+    if action == "audioset":
+        try:
+            chosen_level, chosen_audio = level.split("|", 1)
+        except ValueError:
+            return
+
+        if chosen_level not in LEVELS or chosen_audio not in AUDIO_LEVELS:
+            return
+
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        await query.edit_message_text(
+            f"🎚️ {LEVELS[chosen_level]['label']} · audio: {AUDIO_LEVELS[chosen_audio]['label']}\n"
+            "Boost the volume?",
+            reply_markup=volume_keyboard(message_id, chosen_level, chosen_audio),
+        )
         return
 
-    if action == "compress":
+    if action == "volumeset":
+        try:
+            chosen_level, chosen_audio, boost_str = level.split("|", 2)
+            boost = int(boost_str)
+        except ValueError:
+            return
+
+        if (
+            chosen_level not in LEVELS
+            or chosen_audio not in AUDIO_LEVELS
+            or boost not in VOLUME_BOOST_OPTIONS
+        ):
+            return
+
         pending = pending_compressions.get(message_id)
 
         if pending is None:
@@ -1726,11 +1874,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             input_path=pending["input_path"],
             work_dir=pending["work_dir"],
             original_size=pending["original_size"],
-            level=level,
+            level=chosen_level,
             chat_id=pending["chat_id"],
             source_message_id=message_id,
             status_message=query.message,
             duration=pending.get("duration"),
+            audio_level=chosen_audio,
+            volume_boost_percent=boost,
+        )
+        return
+
+    if level not in LEVELS:
+        return
+
+    if action == "compress":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        duration = pending.get("duration")
+        level_settings = LEVELS[level]
+        total_estimate = pending.get("estimates", {}).get(level)
+
+        # Back out roughly how much of that level's estimate is audio
+        # (using the level's own default audio bitrate) so each audio
+        # quality option can be re-estimated without any extra encoding.
+        default_audio_estimate = estimate_audio_bytes(level_settings["audio_bitrate"], duration)
+        video_only_estimate = None
+        if total_estimate is not None and default_audio_estimate is not None:
+            video_only_estimate = max(0, total_estimate - default_audio_estimate)
+
+        audio_estimates: dict[str, int | None] = {}
+        for audio_key in AUDIO_LEVEL_ORDER:
+            audio_bytes = estimate_audio_bytes(AUDIO_LEVELS[audio_key]["bitrate"], duration)
+            if video_only_estimate is not None and audio_bytes is not None:
+                audio_estimates[audio_key] = video_only_estimate + audio_bytes
+            else:
+                audio_estimates[audio_key] = None
+
+        await query.edit_message_text(
+            f"🎚️ {level_settings['label']} selected. Now pick audio quality:",
+            reply_markup=audio_keyboard(message_id, level, audio_estimates, DEFAULT_AUDIO_LEVEL),
         )
         return
 
