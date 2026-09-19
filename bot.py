@@ -212,6 +212,17 @@ AUDIO_LEVEL_ORDER = ["low", "medium", "high"]
 
 DEFAULT_AUDIO_LEVEL = "medium"
 
+# Sentinel used in place of a real LEVELS key when the input is an
+# audio file with no video stream to compress — skips straight to
+# audio quality + volume boost, same buttons/previews as the video
+# flow, just without a video-level step in front of them.
+AUDIO_ONLY_LEVEL = "audio_only"
+
+# Audio file types accepted directly (message.audio/.voice) or as a
+# document upload — routes into the audio-only flow instead of the
+# video flow.
+AUDIO_FILE_EXTENSIONS = (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".flac", ".opus", ".wma")
+
 # Volume boost is intentionally a fixed set of steps (plus "no
 # boost") rather than a free-form percentage — keeps it simple and
 # gives each step its own preview clip below.
@@ -831,6 +842,37 @@ def make_progress_editor(status_message, label: str):
     return callback
 
 
+async def compress_audio_only(
+    input_path: str,
+    output_path: str,
+    audio_bitrate: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+    volume_boost_percent: int = 0,
+) -> None:
+    """
+    Re-encode an audio-only file at the given bitrate (and optional
+    volume boost) — no video stream involved. Same progress-streaming
+    setup as compress_video, via the shared run_ffmpeg_with_progress.
+    """
+
+    command = ["ffmpeg", "-y"]
+
+    if progress_callback is not None and total_duration:
+        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    command += ["-i", input_path, "-vn", "-c:a", "aac", "-b:a", audio_bitrate]
+
+    if volume_boost_percent:
+        command += ["-af", f"volume={1 + volume_boost_percent / 100:.2f}"]
+
+    command.append(output_path)
+
+    logger.info("Running FFmpeg (audio-only): %s", " ".join(command))
+
+    await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+
+
 async def compress_video(
     input_path: str,
     output_path: str,
@@ -1262,6 +1304,7 @@ async def handle_incoming(
     file_id: str,
     original_size: int | None,
     filename: str,
+    media_type: str = "video",
 ) -> None:
     message = update.effective_message
 
@@ -1280,31 +1323,67 @@ async def handle_incoming(
     Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
     work_dir = Path(
-        tempfile.mkdtemp(prefix=f"video_{message.message_id}_", dir=TEMP_DIR)
+        tempfile.mkdtemp(prefix=f"{media_type}_{message.message_id}_", dir=TEMP_DIR)
     )
 
     input_path = work_dir / "input"
+    is_audio = media_type == "audio"
+    kind_label = "audio" if is_audio else "video"
 
     try:
         size_text = format_size(original_size)
 
         status_message = await message.reply_text(
-            f"📥 Downloading video ({size_text})..."
+            f"📥 Downloading {kind_label} ({size_text})..."
         )
 
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+        await context.bot.send_chat_action(
+            chat_id=chat_id,
+            action=ChatAction.UPLOAD_VOICE if is_audio else ChatAction.UPLOAD_VIDEO,
+        )
 
         telegram_file = await with_retries(context.bot.get_file, file_id)
         await with_retries(telegram_file.download_to_drive, custom_path=str(input_path))
 
         downloaded_size = input_path.stat().st_size
 
+        duration = await get_duration(str(input_path))
+
+        if is_audio:
+            # No video stream to compress — audio-only files skip
+            # straight to the audio quality menu (same one the video
+            # flow shows after a video level is picked).
+            audio_estimates = {
+                audio_key: estimate_audio_bytes(AUDIO_LEVELS[audio_key]["bitrate"], duration)
+                for audio_key in AUDIO_LEVEL_ORDER
+            }
+
+            remember_pending(
+                message.message_id,
+                {
+                    "input_path": input_path,
+                    "work_dir": work_dir,
+                    "original_size": downloaded_size,
+                    "filename": filename,
+                    "chat_id": chat_id,
+                    "duration": duration,
+                    "media_type": "audio",
+                },
+            )
+
+            await status_message.edit_text(
+                f"🎧 Original size: {format_size(downloaded_size)}\nPick audio quality:",
+                reply_markup=audio_keyboard(
+                    message.message_id, AUDIO_ONLY_LEVEL, audio_estimates, DEFAULT_AUDIO_LEVEL
+                ),
+            )
+            return
+
         await status_message.edit_text(
             f"🔎 Analyzing video ({format_size(downloaded_size)})...\n"
             "Estimating size at each compression level, one moment..."
         )
 
-        duration = await get_duration(str(input_path))
         estimates = await estimate_all_levels(str(input_path), duration, work_dir)
 
         remember_pending(
@@ -1317,6 +1396,7 @@ async def handle_incoming(
                 "chat_id": chat_id,
                 "duration": duration,
                 "estimates": estimates,
+                "media_type": "video",
             },
         )
 
@@ -1338,11 +1418,11 @@ async def handle_incoming(
         )
 
     except Exception as error:
-        logger.exception("Error analyzing video:")
+        logger.exception("Error analyzing %s:", "audio" if is_audio else "video")
         cleanup_work_dir(work_dir)
         pending_compressions.pop(message.message_id, None)
         await message.reply_text(
-            f"❌ Something went wrong while analyzing the video.\n\nError: {error}"
+            f"❌ Something went wrong while analyzing the {kind_label}.\n\nError: {error}"
         )
 
 
@@ -1352,7 +1432,7 @@ async def run_compression(
     input_path: Path,
     work_dir: Path,
     original_size: int | None,
-    level: str,
+    level: str | None,
     chat_id: int,
     source_message_id: int,
     status_message=None,
@@ -1360,12 +1440,19 @@ async def run_compression(
     audio_level: str = DEFAULT_AUDIO_LEVEL,
     volume_boost_percent: int = 0,
 ) -> None:
+    """
+    level=None means "audio-only" — no video stream to compress, just
+    re-encode the audio at the chosen quality/boost and send it back
+    as an audio file instead of a video.
+    """
+
     global active_compressions
 
-    level_info = LEVELS[level]
+    is_audio_only = level is None
+    level_info = None if is_audio_only else LEVELS[level]
     audio_info = AUDIO_LEVELS[audio_level]
     audio_bitrate = audio_info["bitrate"]
-    output_path = work_dir / "compressed.mp4"
+    output_path = work_dir / ("compressed.m4a" if is_audio_only else "compressed.mp4")
 
     job_token = object()
     queue_refresh_task = None
@@ -1427,6 +1514,8 @@ async def run_compression(
             try:
                 boost_suffix = f" · 🔊+{volume_boost_percent}%" if volume_boost_percent else ""
                 compressing_label = (
+                    f"⚙️ Compressing audio ({audio_info['label']}{boost_suffix})..."
+                    if is_audio_only else
                     f"⚙️ Compressing at {level_info['label']} "
                     f"(audio: {audio_info['label']}{boost_suffix})..."
                 )
@@ -1437,7 +1526,10 @@ async def run_compression(
                 else:
                     status_message = await with_retries(context.bot.send_message, chat_id=chat_id, text=text)
 
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.UPLOAD_VOICE if is_audio_only else ChatAction.UPLOAD_VIDEO,
+                )
 
                 progress_state = {
                     "last_percent": -10.0,
@@ -1484,15 +1576,25 @@ async def run_compression(
                         # shouldn't abort the actual compression.
                         pass
 
-                await compress_video(
-                    str(input_path),
-                    str(output_path),
-                    level,
-                    total_duration=duration,
-                    progress_callback=on_progress if duration else None,
-                    audio_bitrate=audio_bitrate,
-                    volume_boost_percent=volume_boost_percent,
-                )
+                if is_audio_only:
+                    await compress_audio_only(
+                        str(input_path),
+                        str(output_path),
+                        audio_bitrate,
+                        total_duration=duration,
+                        progress_callback=on_progress if duration else None,
+                        volume_boost_percent=volume_boost_percent,
+                    )
+                else:
+                    await compress_video(
+                        str(input_path),
+                        str(output_path),
+                        level,
+                        total_duration=duration,
+                        progress_callback=on_progress if duration else None,
+                        audio_bitrate=audio_bitrate,
+                        volume_boost_percent=volume_boost_percent,
+                    )
             finally:
                 active_compressions -= 1
                 active_job_progress.pop(job_token, None)
@@ -1504,6 +1606,26 @@ async def run_compression(
             percentage = (saved / original_size) * 100
         else:
             percentage = 0
+
+        if is_audio_only:
+            output_duration = await get_duration(str(output_path))
+
+            await status_message.edit_text("📤 Sending compressed audio...")
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+
+            await with_retries(
+                context.bot.send_audio,
+                chat_id=chat_id,
+                audio=str(output_path),
+                duration=round(output_duration) if output_duration else None,
+                caption=(
+                    f"✅ Compression complete! (audio: {audio_info['label']}{boost_suffix})\n\n"
+                    f"Original: {format_size(original_size)}\n"
+                    f"Compressed: {format_size(compressed_size)}\n"
+                    f"Saved: {percentage:.1f}%"
+                ),
+            )
+            return
 
         # Probe the actual compressed file for duration/dimensions
         # (rather than reusing the source video's numbers) and grab
@@ -1538,7 +1660,7 @@ async def run_compression(
         )
 
     except Exception as error:
-        logger.exception("Error compressing video:")
+        logger.exception("Error compressing %s:", "audio" if is_audio_only else "video")
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"❌ Something went wrong while compressing.\n\nError: {error}",
@@ -1585,6 +1707,31 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+
+    if message is None or (message.audio is None and message.voice is None):
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(message, user_id)
+        return
+
+    audio = message.audio or message.voice
+    filename = getattr(audio, "file_name", None) or f"audio_{message.message_id}.m4a"
+    remember_file(message.message_id, audio.file_id, audio.file_size)
+
+    await handle_incoming(
+        update, context,
+        file_id=audio.file_id,
+        original_size=audio.file_size,
+        filename=filename,
+        media_type="audio",
+    )
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
 
@@ -1607,9 +1754,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpeg", ".mpg", ".3gp")
         )
     )
+    is_audio = (
+        mime_type.startswith("audio/")
+        or filename.lower().endswith(AUDIO_FILE_EXTENSIONS)
+    )
 
-    if not is_video:
-        await message.reply_text("❌ That doesn't look like a video file.")
+    if not is_video and not is_audio:
+        await message.reply_text("❌ That doesn't look like a video or audio file.")
         return
 
     remember_file(message.message_id, document.file_id, document.file_size)
@@ -1619,6 +1770,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         file_id=document.file_id,
         original_size=document.file_size,
         filename=filename,
+        media_type="audio" if is_audio else "video",
     )
 
 
@@ -1966,14 +2118,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             return
 
-        if chosen_level not in LEVELS or chosen_audio not in AUDIO_LEVELS:
+        is_audio_only = chosen_level == AUDIO_ONLY_LEVEL
+
+        if (not is_audio_only and chosen_level not in LEVELS) or chosen_audio not in AUDIO_LEVELS:
             return
 
         pending = pending_compressions.get(message_id)
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                "⚠️ That file isn't in my cache anymore — please resend it."
             )
             return
 
@@ -1983,8 +2137,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         duration = pending.get("duration")
         audio_bitrate = AUDIO_LEVELS[chosen_audio]["bitrate"]
 
+        header = (
+            f"🎧 Audio quality: {AUDIO_LEVELS[chosen_audio]['label']}"
+            if is_audio_only else
+            f"🎚️ {LEVELS[chosen_level]['label']} · audio: {AUDIO_LEVELS[chosen_audio]['label']}"
+        )
+
         await query.edit_message_text(
-            f"🎚️ {LEVELS[chosen_level]['label']} · audio: {AUDIO_LEVELS[chosen_audio]['label']}\n"
+            f"{header}\n"
             f"🎧 Generating {VOLUME_PREVIEW_SECONDS}s previews at each volume level — one moment..."
         )
 
@@ -2005,7 +2165,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🎧 {sample_duration:.0f}s preview at each volume level, from the middle of the video:",
+            text=f"🎧 {sample_duration:.0f}s preview at each volume level, from the middle:",
         )
 
         for boost, preview_path in sorted(results, key=lambda item: item[0]):
@@ -2042,8 +2202,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             return
 
+        is_audio_only = chosen_level == AUDIO_ONLY_LEVEL
+
         if (
-            chosen_level not in LEVELS
+            (not is_audio_only and chosen_level not in LEVELS)
             or chosen_audio not in AUDIO_LEVELS
             or boost not in VOLUME_BOOST_OPTIONS
         ):
@@ -2053,7 +2215,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                "⚠️ That file isn't in my cache anymore — please resend it."
             )
             return
 
@@ -2062,7 +2224,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             input_path=pending["input_path"],
             work_dir=pending["work_dir"],
             original_size=pending["original_size"],
-            level=chosen_level,
+            level=None if is_audio_only else chosen_level,
             chat_id=pending["chat_id"],
             source_message_id=message_id,
             status_message=query.message,
@@ -2188,6 +2350,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("setlevel", setlevel))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)
