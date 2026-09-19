@@ -232,6 +232,51 @@ VOLUME_BOOST_OPTIONS = [0] + list(range(20, 201, 20))  # 0, 20, 40, ..., 200 per
 # before the user picks one.
 VOLUME_PREVIEW_SECONDS = int(os.getenv("VOLUME_PREVIEW_SECONDS", "20"))
 
+# ------------------------------------------------------------
+# Audio enhancements (optional, toggled before the volume step)
+# ------------------------------------------------------------
+
+# FFT-based denoiser — cuts steady background hiss/hum (fan noise,
+# room tone, mic self-noise). nf is the assumed noise floor in dB;
+# -25 is ffmpeg's own default and works reasonably broadly.
+NOISE_REDUCTION_FILTER = os.getenv("NOISE_REDUCTION_FILTER", "afftdn=nf=-25")
+
+# Tuned for spoken lecture/voice recordings: a highpass to cut
+# low-end rumble/mic handling noise below where voice lives, a
+# presence-band boost around 3kHz for intelligibility, then
+# dynaudnorm to even out volume swings from mic distance changing
+# (walking around, turning away from the mic, etc).
+VOICE_ENHANCEMENT_FILTER = os.getenv(
+    "VOICE_ENHANCEMENT_FILTER",
+    "highpass=f=100,equalizer=f=3000:width_type=o:width=1.5:g=4,dynaudnorm=f=150:g=15",
+)
+
+
+def build_audio_filter_chain(
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+    volume_boost_percent: int = 0,
+) -> str | None:
+    """
+    Combines the optional audio filters into one -af filtergraph, in
+    a sensible order: clean up noise first, then reshape for voice
+    clarity, then apply the volume boost last (so gain staging happens
+    after cleanup, not before it). Returns None if nothing's enabled.
+    """
+
+    parts = []
+
+    if noise_reduction:
+        parts.append(NOISE_REDUCTION_FILTER)
+
+    if voice_enhancement:
+        parts.append(VOICE_ENHANCEMENT_FILTER)
+
+    if volume_boost_percent:
+        parts.append(f"volume={1 + volume_boost_percent / 100:.2f}")
+
+    return ",".join(parts) if parts else None
+
 # Per-chat default level, used only to mark which button is
 # starred in the estimate menu.
 chat_default_level: dict[int, str] = {}
@@ -534,11 +579,18 @@ def audio_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def volume_keyboard(message_id: int, level: str, audio_level: str) -> InlineKeyboardMarkup:
+def volume_keyboard(
+    message_id: int,
+    level: str,
+    audio_level: str,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+) -> InlineKeyboardMarkup:
+    flags = f"{int(noise_reduction)}{int(voice_enhancement)}"
     buttons = [
         InlineKeyboardButton(
             "🔈 No boost" if boost == 0 else f"🔊 +{boost}%",
-            callback_data=f"volumeset:{level}|{audio_level}|{boost}:{message_id}",
+            callback_data=f"volumeset:{level}|{audio_level}|{boost}|{flags}:{message_id}",
         )
         for boost in VOLUME_BOOST_OPTIONS
     ]
@@ -547,6 +599,40 @@ def volume_keyboard(message_id: int, level: str, audio_level: str) -> InlineKeyb
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")])
 
     return InlineKeyboardMarkup(rows)
+
+
+def enhancement_keyboard(
+    message_id: int,
+    level: str,
+    audio_level: str,
+    noise_reduction: bool,
+    voice_enhancement: bool,
+) -> InlineKeyboardMarkup:
+    noise_label = f"🔇 Noise reduction: {'ON ✅' if noise_reduction else 'OFF'}"
+    voice_label = f"🎙 Voice enhancement: {'ON ✅' if voice_enhancement else 'OFF'}"
+
+    # Each toggle button's callback carries the flag state that
+    # results from tapping IT specifically — flip its own bit, leave
+    # the other one as-is.
+    after_noise_toggle = f"{int(not noise_reduction)}{int(voice_enhancement)}"
+    after_voice_toggle = f"{int(noise_reduction)}{int(not voice_enhancement)}"
+    current_flags = f"{int(noise_reduction)}{int(voice_enhancement)}"
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            noise_label,
+            callback_data=f"enhset:{level}|{audio_level}|{after_noise_toggle}:{message_id}",
+        )],
+        [InlineKeyboardButton(
+            voice_label,
+            callback_data=f"enhset:{level}|{audio_level}|{after_voice_toggle}:{message_id}",
+        )],
+        [InlineKeyboardButton(
+            "▶️ Continue",
+            callback_data=f"enhcontinue:{level}|{audio_level}|{current_flags}:{message_id}",
+        )],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")],
+    ])
 
 
 def pdf_interval_keyboard(message_id: int) -> InlineKeyboardMarkup:
@@ -699,6 +785,8 @@ def build_ffmpeg_command(
     enable_progress: bool = False,
     audio_bitrate: str | None = None,
     volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
 ) -> list[str]:
     command = ["ffmpeg", "-y"]
 
@@ -732,9 +820,9 @@ def build_ffmpeg_command(
         "-b:a", audio_bitrate or settings["audio_bitrate"],
     ]
 
-    if volume_boost_percent:
-        # e.g. +20% -> volume=1.20
-        command += ["-af", f"volume={1 + volume_boost_percent / 100:.2f}"]
+    audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
+    if audio_filter_chain:
+        command += ["-af", audio_filter_chain]
 
     command += [
         "-movflags", "+faststart",
@@ -849,11 +937,14 @@ async def compress_audio_only(
     total_duration: float | None = None,
     progress_callback=None,
     volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
 ) -> None:
     """
     Re-encode an audio-only file at the given bitrate (and optional
-    volume boost) — no video stream involved. Same progress-streaming
-    setup as compress_video, via the shared run_ffmpeg_with_progress.
+    volume boost / noise reduction / voice enhancement) — no video
+    stream involved. Same progress-streaming setup as compress_video,
+    via the shared run_ffmpeg_with_progress.
     """
 
     command = ["ffmpeg", "-y"]
@@ -863,8 +954,9 @@ async def compress_audio_only(
 
     command += ["-i", input_path, "-vn", "-c:a", "aac", "-b:a", audio_bitrate]
 
-    if volume_boost_percent:
-        command += ["-af", f"volume={1 + volume_boost_percent / 100:.2f}"]
+    audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
+    if audio_filter_chain:
+        command += ["-af", audio_filter_chain]
 
     command.append(output_path)
 
@@ -881,6 +973,8 @@ async def compress_video(
     progress_callback=None,
     audio_bitrate: str | None = None,
     volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
 ) -> None:
     """
     Compress a video with FFmpeg. If total_duration and a
@@ -899,6 +993,8 @@ async def compress_video(
         enable_progress=True,
         audio_bitrate=audio_bitrate,
         volume_boost_percent=volume_boost_percent,
+        noise_reduction=noise_reduction,
+        voice_enhancement=voice_enhancement,
     )
 
     logger.info("Running FFmpeg (%s): %s", level, " ".join(command))
@@ -1153,11 +1249,13 @@ async def generate_volume_preview(
     sample_duration: float,
     audio_bitrate: str,
     boost_percent: int,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
 ) -> bool:
     """
-    Extracts a short audio-only clip with the given volume boost
-    applied, so the user can listen before picking a level. Returns
-    True on success.
+    Extracts a short audio-only clip with the given volume boost (and
+    any enabled noise reduction / voice enhancement) applied, so the
+    user can listen before picking a level. Returns True on success.
     """
 
     command = ["ffmpeg", "-y"]
@@ -1167,8 +1265,9 @@ async def generate_volume_preview(
 
     command += ["-i", input_path, "-t", f"{sample_duration:.2f}", "-vn", "-c:a", "aac", "-b:a", audio_bitrate]
 
-    if boost_percent:
-        command += ["-af", f"volume={1 + boost_percent / 100:.2f}"]
+    audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, boost_percent)
+    if audio_filter_chain:
+        command += ["-af", audio_filter_chain]
 
     command.append(output_path)
 
@@ -1439,6 +1538,8 @@ async def run_compression(
     duration: float | None = None,
     audio_level: str = DEFAULT_AUDIO_LEVEL,
     volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
 ) -> None:
     """
     level=None means "audio-only" — no video stream to compress, just
@@ -1513,11 +1614,18 @@ async def run_compression(
             }
             try:
                 boost_suffix = f" · 🔊+{volume_boost_percent}%" if volume_boost_percent else ""
+                enhancement_bits = []
+                if noise_reduction:
+                    enhancement_bits.append("🔇 noise reduction")
+                if voice_enhancement:
+                    enhancement_bits.append("🎙 voice enhancement")
+                enhancement_suffix = f" · {' + '.join(enhancement_bits)}" if enhancement_bits else ""
+
                 compressing_label = (
-                    f"⚙️ Compressing audio ({audio_info['label']}{boost_suffix})..."
+                    f"⚙️ Compressing audio ({audio_info['label']}{boost_suffix}{enhancement_suffix})..."
                     if is_audio_only else
                     f"⚙️ Compressing at {level_info['label']} "
-                    f"(audio: {audio_info['label']}{boost_suffix})..."
+                    f"(audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})..."
                 )
                 text = f"{compressing_label}\n{render_progress_bar(0)}"
 
@@ -1584,6 +1692,8 @@ async def run_compression(
                         total_duration=duration,
                         progress_callback=on_progress if duration else None,
                         volume_boost_percent=volume_boost_percent,
+                        noise_reduction=noise_reduction,
+                        voice_enhancement=voice_enhancement,
                     )
                 else:
                     await compress_video(
@@ -1594,6 +1704,8 @@ async def run_compression(
                         progress_callback=on_progress if duration else None,
                         audio_bitrate=audio_bitrate,
                         volume_boost_percent=volume_boost_percent,
+                        noise_reduction=noise_reduction,
+                        voice_enhancement=voice_enhancement,
                     )
             finally:
                 active_compressions -= 1
@@ -1619,7 +1731,7 @@ async def run_compression(
                 audio=str(output_path),
                 duration=round(output_duration) if output_duration else None,
                 caption=(
-                    f"✅ Compression complete! (audio: {audio_info['label']}{boost_suffix})\n\n"
+                    f"✅ Compression complete! (audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})\n\n"
                     f"Original: {format_size(original_size)}\n"
                     f"Compressed: {format_size(compressed_size)}\n"
                     f"Saved: {percentage:.1f}%"
@@ -1651,7 +1763,7 @@ async def run_compression(
             duration=round(output_duration) if output_duration else None,
             thumbnail=str(thumbnail_path) if has_thumbnail else None,
             caption=(
-                f"✅ Compression complete! ({level_info['label']}, audio: {audio_info['label']}{boost_suffix})\n\n"
+                f"✅ Compression complete! ({level_info['label']}, audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})\n\n"
                 f"Original: {format_size(original_size)}\n"
                 f"Compressed: {format_size(compressed_size)}\n"
                 f"Saved: {percentage:.1f}%"
@@ -2131,11 +2243,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
-        chat_id = pending["chat_id"]
-        input_path = pending["input_path"]
-        work_dir = pending["work_dir"]
-        duration = pending.get("duration")
-        audio_bitrate = AUDIO_LEVELS[chosen_audio]["bitrate"]
+        header = (
+            f"🎧 Audio quality: {AUDIO_LEVELS[chosen_audio]['label']}"
+            if is_audio_only else
+            f"🎚️ {LEVELS[chosen_level]['label']} · audio: {AUDIO_LEVELS[chosen_audio]['label']}"
+        )
+
+        await query.edit_message_text(
+            f"{header}\n🎛 Optional audio enhancements — toggle, then continue:",
+            reply_markup=enhancement_keyboard(message_id, chosen_level, chosen_audio, False, False),
+        )
+        return
+
+    if action == "enhset":
+        try:
+            chosen_level, chosen_audio, flags_str = level.split("|", 2)
+            noise_reduction = flags_str[0] == "1"
+            voice_enhancement = flags_str[1] == "1"
+        except (ValueError, IndexError):
+            return
+
+        is_audio_only = chosen_level == AUDIO_ONLY_LEVEL
+
+        if (not is_audio_only and chosen_level not in LEVELS) or chosen_audio not in AUDIO_LEVELS:
+            return
 
         header = (
             f"🎧 Audio quality: {AUDIO_LEVELS[chosen_audio]['label']}"
@@ -2144,8 +2275,49 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
         await query.edit_message_text(
-            f"{header}\n"
-            f"🎧 Generating {VOLUME_PREVIEW_SECONDS}s previews at each volume level — one moment..."
+            f"{header}\n🎛 Optional audio enhancements — toggle, then continue:",
+            reply_markup=enhancement_keyboard(
+                message_id, chosen_level, chosen_audio, noise_reduction, voice_enhancement
+            ),
+        )
+        return
+
+    if action == "enhcontinue":
+        try:
+            chosen_level, chosen_audio, flags_str = level.split("|", 2)
+            noise_reduction = flags_str[0] == "1"
+            voice_enhancement = flags_str[1] == "1"
+        except (ValueError, IndexError):
+            return
+
+        is_audio_only = chosen_level == AUDIO_ONLY_LEVEL
+
+        if (not is_audio_only and chosen_level not in LEVELS) or chosen_audio not in AUDIO_LEVELS:
+            return
+
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That file isn't in my cache anymore — please resend it."
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        audio_bitrate = AUDIO_LEVELS[chosen_audio]["bitrate"]
+
+        enhancement_bits = []
+        if noise_reduction:
+            enhancement_bits.append("🔇 noise reduction")
+        if voice_enhancement:
+            enhancement_bits.append("🎙 voice enhancement")
+        enhancement_note = f" ({' + '.join(enhancement_bits)})" if enhancement_bits else ""
+
+        await query.edit_message_text(
+            f"🎧 Generating {VOLUME_PREVIEW_SECONDS}s previews at each volume level{enhancement_note} — one moment..."
         )
 
         sample_duration = min(VOLUME_PREVIEW_SECONDS, duration) if duration else VOLUME_PREVIEW_SECONDS
@@ -2158,6 +2330,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             async with preview_semaphore:
                 ok = await generate_volume_preview(
                     str(input_path), str(preview_path), seek, sample_duration, audio_bitrate, boost,
+                    noise_reduction=noise_reduction, voice_enhancement=voice_enhancement,
                 )
             return boost, (preview_path if ok else None)
 
@@ -2165,7 +2338,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🎧 {sample_duration:.0f}s preview at each volume level, from the middle:",
+            text=f"🎧 {sample_duration:.0f}s preview at each volume level{enhancement_note}, from the middle:",
         )
 
         for boost, preview_path in sorted(results, key=lambda item: item[0]):
@@ -2191,15 +2364,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await context.bot.send_message(
             chat_id=chat_id,
             text="Pick a volume level:",
-            reply_markup=volume_keyboard(message_id, chosen_level, chosen_audio),
+            reply_markup=volume_keyboard(
+                message_id, chosen_level, chosen_audio, noise_reduction, voice_enhancement
+            ),
         )
         return
 
     if action == "volumeset":
         try:
-            chosen_level, chosen_audio, boost_str = level.split("|", 2)
+            chosen_level, chosen_audio, boost_str, flags_str = level.split("|", 3)
             boost = int(boost_str)
-        except ValueError:
+            noise_reduction = flags_str[0] == "1"
+            voice_enhancement = flags_str[1] == "1"
+        except (ValueError, IndexError):
             return
 
         is_audio_only = chosen_level == AUDIO_ONLY_LEVEL
@@ -2231,6 +2408,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             duration=pending.get("duration"),
             audio_level=chosen_audio,
             volume_boost_percent=boost,
+            noise_reduction=noise_reduction,
+            voice_enhancement=voice_enhancement,
         )
         return
 
