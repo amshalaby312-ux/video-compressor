@@ -4,6 +4,7 @@ import logging
 import shutil
 import tempfile
 import time
+import contextlib
 from pathlib import Path
 
 import img2pdf
@@ -211,10 +212,14 @@ AUDIO_LEVEL_ORDER = ["low", "medium", "high"]
 
 DEFAULT_AUDIO_LEVEL = "medium"
 
-# Volume boost is intentionally limited to these three fixed steps
-# (plus "no boost") rather than a free-form percentage — keeps the
-# button row small and avoids people cranking it into clipping.
-VOLUME_BOOST_OPTIONS = [0, 20, 40, 60]  # percent
+# Volume boost is intentionally a fixed set of steps (plus "no
+# boost") rather than a free-form percentage — keeps it simple and
+# gives each step its own preview clip below.
+VOLUME_BOOST_OPTIONS = [0] + list(range(20, 201, 20))  # 0, 20, 40, ..., 200 percent
+
+# Length of the audio-only preview clip sent for each volume level
+# before the user picks one.
+VOLUME_PREVIEW_SECONDS = int(os.getenv("VOLUME_PREVIEW_SECONDS", "20"))
 
 # Per-chat default level, used only to mark which button is
 # starred in the estimate menu.
@@ -246,6 +251,56 @@ RECENT_FILES_MAX = 200
 # on the single asyncio event loop, no separate threads involved.
 compression_semaphore = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
 active_compressions = 0
+
+# job_token (a unique object per compression call) -> live progress, for
+# jobs currently actually encoding. Used to estimate how long a queued
+# job will have to wait.
+active_job_progress: dict[object, dict] = {}
+
+# FIFO of jobs waiting for a compression slot: [{"job_id": token, "duration": seconds|None}, ...]
+compression_queue: list[dict] = []
+
+
+def estimate_queue_wait_seconds(job_token: object) -> float:
+    """
+    Rough estimate of how long job_token will wait for a compression
+    slot: the remaining time on whatever's actively encoding right
+    now, plus the expected encode time of every job ahead of it in
+    the queue. "Expected encode time" for a queued-but-not-yet-started
+    job is guessed from the encode rate (seconds of encoding per
+    second of source video) observed on whichever active job has made
+    enough progress to measure it — falling back to a rough "about
+    real-time" assumption if nothing's measurable yet.
+    """
+
+    now = time.monotonic()
+
+    encode_rate = 1.0  # fallback: assume roughly 1 second of encoding per second of video
+
+    for info in active_job_progress.values():
+        if info["percent"] >= 1 and info["duration"]:
+            elapsed = now - info["start_time"]
+            processed_seconds = info["duration"] * (info["percent"] / 100)
+            if processed_seconds > 0:
+                encode_rate = elapsed / processed_seconds
+                break
+
+    total_wait = 0.0
+
+    for info in active_job_progress.values():
+        elapsed = now - info["start_time"]
+        if info["percent"] >= 1:
+            total_wait += elapsed * (100 - info["percent"]) / info["percent"]
+        elif info["duration"]:
+            total_wait += max(0.0, info["duration"] * encode_rate - elapsed)
+
+    for entry in compression_queue:
+        if entry["job_id"] is job_token:
+            break
+        if entry["duration"]:
+            total_wait += entry["duration"] * encode_rate
+
+    return total_wait
 
 
 def get_default_level(chat_id: int) -> str:
@@ -469,7 +524,7 @@ def audio_keyboard(
 
 
 def volume_keyboard(message_id: int, level: str, audio_level: str) -> InlineKeyboardMarkup:
-    row = [
+    buttons = [
         InlineKeyboardButton(
             "🔈 No boost" if boost == 0 else f"🔊 +{boost}%",
             callback_data=f"volumeset:{level}|{audio_level}|{boost}:{message_id}",
@@ -477,10 +532,10 @@ def volume_keyboard(message_id: int, level: str, audio_level: str) -> InlineKeyb
         for boost in VOLUME_BOOST_OPTIONS
     ]
 
-    return InlineKeyboardMarkup([
-        row,
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")],
-    ])
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")])
+
+    return InlineKeyboardMarkup(rows)
 
 
 def pdf_interval_keyboard(message_id: int) -> InlineKeyboardMarkup:
@@ -1049,6 +1104,41 @@ async def dedup_frames(
     return kept, removed, threshold
 
 
+async def generate_volume_preview(
+    input_path: str,
+    output_path: str,
+    seek: float,
+    sample_duration: float,
+    audio_bitrate: str,
+    boost_percent: int,
+) -> bool:
+    """
+    Extracts a short audio-only clip with the given volume boost
+    applied, so the user can listen before picking a level. Returns
+    True on success.
+    """
+
+    command = ["ffmpeg", "-y"]
+
+    if seek:
+        command += ["-ss", f"{seek:.2f}"]
+
+    command += ["-i", input_path, "-t", f"{sample_duration:.2f}", "-vn", "-c:a", "aac", "-b:a", audio_bitrate]
+
+    if boost_percent:
+        command += ["-af", f"volume={1 + boost_percent / 100:.2f}"]
+
+    command.append(output_path)
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("Volume preview failed (+%s%%): %s", boost_percent, stderr.decode(errors="replace"))
+        return False
+
+    return True
+
+
 async def estimate_level_size(
     input_path: str,
     duration: float | None,
@@ -1277,24 +1367,63 @@ async def run_compression(
     audio_bitrate = audio_info["bitrate"]
     output_path = work_dir / "compressed.mp4"
 
+    job_token = object()
+    queue_refresh_task = None
+
     try:
         # Queue: only MAX_CONCURRENT_COMPRESSIONS compressions actually
         # encode at once. If others are already running, say so up
-        # front instead of leaving the user staring at 0%.
+        # front — with an estimated wait — instead of leaving the
+        # user staring at 0%.
         if active_compressions >= MAX_CONCURRENT_COMPRESSIONS:
-            queue_text = (
-                f"🕓 {active_compressions} compression(s) already in progress — "
-                "you're queued and will start automatically..."
-            )
-            if status_message is not None:
-                await with_retries(status_message.edit_text, queue_text)
-            else:
-                status_message = await with_retries(
-                    context.bot.send_message, chat_id=chat_id, text=queue_text
+            compression_queue.append({"job_id": job_token, "duration": duration})
+
+            def queue_text() -> str:
+                position = next(
+                    (i for i, entry in enumerate(compression_queue) if entry["job_id"] is job_token),
+                    len(compression_queue) - 1,
+                )
+                wait_seconds = estimate_queue_wait_seconds(job_token)
+                return (
+                    f"🕓 {active_compressions} compression(s) in progress, "
+                    f"{position} ahead of you in queue — "
+                    f"~{format_duration(wait_seconds)} estimated wait..."
                 )
 
+            if status_message is not None:
+                await with_retries(status_message.edit_text, queue_text())
+            else:
+                status_message = await with_retries(
+                    context.bot.send_message, chat_id=chat_id, text=queue_text()
+                )
+
+            async def refresh_queue_message() -> None:
+                # Re-estimate and re-post the wait periodically while
+                # this job sits in the queue, so the estimate reflects
+                # real progress on whatever's currently encoding.
+                while True:
+                    await asyncio.sleep(8)
+                    try:
+                        await status_message.edit_text(queue_text())
+                    except Exception:
+                        pass
+
+            queue_refresh_task = asyncio.create_task(refresh_queue_message())
+
         async with compression_semaphore:
+            if queue_refresh_task is not None:
+                queue_refresh_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await queue_refresh_task
+
+            compression_queue[:] = [entry for entry in compression_queue if entry["job_id"] is not job_token]
+
             active_compressions += 1
+            active_job_progress[job_token] = {
+                "start_time": time.monotonic(),
+                "duration": duration,
+                "percent": 0.0,
+            }
             try:
                 boost_suffix = f" · 🔊+{volume_boost_percent}%" if volume_boost_percent else ""
                 compressing_label = (
@@ -1317,6 +1446,8 @@ async def run_compression(
                 }
 
                 async def on_progress(percent: float) -> None:
+                    active_job_progress[job_token]["percent"] = percent
+
                     now = time.monotonic()
 
                     # Throttle edits so we don't hammer Telegram's rate limit —
@@ -1364,6 +1495,7 @@ async def run_compression(
                 )
             finally:
                 active_compressions -= 1
+                active_job_progress.pop(job_token, None)
 
         compressed_size = output_path.stat().st_size
 
@@ -1413,6 +1545,11 @@ async def run_compression(
         )
 
     finally:
+        if queue_refresh_task is not None and not queue_refresh_task.done():
+            queue_refresh_task.cancel()
+        compression_queue[:] = [entry for entry in compression_queue if entry["job_id"] is not job_token]
+        active_job_progress.pop(job_token, None)
+
         if source_message_id in pending_compressions:
             clear_pending(source_message_id)
         else:
@@ -1840,9 +1977,60 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        audio_bitrate = AUDIO_LEVELS[chosen_audio]["bitrate"]
+
         await query.edit_message_text(
             f"🎚️ {LEVELS[chosen_level]['label']} · audio: {AUDIO_LEVELS[chosen_audio]['label']}\n"
-            "Boost the volume?",
+            f"🎧 Generating {VOLUME_PREVIEW_SECONDS}s previews at each volume level — one moment..."
+        )
+
+        sample_duration = min(VOLUME_PREVIEW_SECONDS, duration) if duration else VOLUME_PREVIEW_SECONDS
+        seek = max(0.0, (duration - sample_duration) / 2) if duration else 0.0
+
+        preview_semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+
+        async def bounded_preview(boost: int) -> tuple[int, Path | None]:
+            preview_path = work_dir / f"preview_{boost}.m4a"
+            async with preview_semaphore:
+                ok = await generate_volume_preview(
+                    str(input_path), str(preview_path), seek, sample_duration, audio_bitrate, boost,
+                )
+            return boost, (preview_path if ok else None)
+
+        results = await asyncio.gather(*(bounded_preview(boost) for boost in VOLUME_BOOST_OPTIONS))
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🎧 {sample_duration:.0f}s preview at each volume level, from the middle of the video:",
+        )
+
+        for boost, preview_path in sorted(results, key=lambda item: item[0]):
+            label = "No boost" if boost == 0 else f"+{boost}%"
+
+            if preview_path is None:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=f"⚠️ Couldn't generate a preview for {label}."
+                )
+                continue
+
+            try:
+                await with_retries(
+                    context.bot.send_audio,
+                    chat_id=chat_id,
+                    audio=str(preview_path),
+                    title=label,
+                    caption=f"🔊 {label}",
+                )
+            finally:
+                preview_path.unlink(missing_ok=True)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Pick a volume level:",
             reply_markup=volume_keyboard(message_id, chosen_level, chosen_audio),
         )
         return
