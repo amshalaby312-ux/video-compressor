@@ -228,6 +228,18 @@ AUDIO_ONLY_LEVEL = "audio_only"
 # untouched. Same audio buttons/previews as the other flows.
 AUDIO_EDIT_LEVEL = "audio_edit"
 
+# Sentinel for a VIDEO input where the user wants its audio track
+# swapped for a different recording they send next. Video is copied
+# untouched; the new recording becomes the audio. (Only ever passed
+# to run_compression together with replacement_audio_path — it never
+# appears in callback data, so it's not part of is_flow_level.)
+AUDIO_REPLACE_LEVEL = "audio_replace"
+
+# Audio quality used for a replacement recording. The video is copied
+# (not re-encoded), so the extra bitrate over "medium" costs very
+# little size but keeps the user's recording sounding as good as sent.
+REPLACE_AUDIO_LEVEL = "high"
+
 
 def is_flow_level(level: str) -> bool:
     """True for a real video level or either audio-flow sentinel."""
@@ -321,6 +333,11 @@ PENDING_MAX = 5
 # It's only torn down when the user sends another video or taps
 # "Finish session" — see clear_pending().
 open_pdf_sessions: dict[int, int] = {}
+
+# chat_id -> message_id of the video whose audio is about to be replaced.
+# While an entry exists, the next audio recording that chat sends is
+# treated as the replacement track instead of a new audio file to compress.
+awaiting_audio_replacement: dict[int, int] = {}
 
 # Small cache so "redo at a different level" on an already-sent
 # result can re-fetch the source without asking you to resend.
@@ -425,6 +442,12 @@ def clear_pending(message_id: int) -> None:
     ]
     for chat_id in stale_chats:
         open_pdf_sessions.pop(chat_id, None)
+
+    waiting_chats = [
+        chat_id for chat_id, mid in awaiting_audio_replacement.items() if mid == message_id
+    ]
+    for chat_id in waiting_chats:
+        awaiting_audio_replacement.pop(chat_id, None)
 
 
 def remember_pending(message_id: int, entry: dict) -> None:
@@ -568,6 +591,13 @@ def estimate_keyboard(message_id: int, estimates: dict[str, int | None], highlig
         InlineKeyboardButton(
             "🎧 Just edit audio (keep video as is)",
             callback_data=f"audioedit:_:{message_id}",
+        )
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "🔁 Replace audio (send a recording)",
+            callback_data=f"audioreplace:_:{message_id}",
         )
     ])
 
@@ -1076,6 +1106,49 @@ async def edit_video_audio(
     ]
 
     logger.info("Running FFmpeg (audio edit, video copied): %s", " ".join(command))
+
+    await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+
+
+async def replace_video_audio(
+    video_path: str,
+    audio_path: str,
+    output_path: str,
+    audio_bitrate: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+) -> None:
+    """
+    Swap a video's audio track for a different recording. The video
+    stream is copied untouched; the recording is encoded to AAC so it
+    fits in the mp4. The VIDEO decides the final length:
+      - recording longer than the video  -> cut off where the video ends
+      - recording shorter than the video -> silence for the remainder
+    (`apad` pads the audio with silence forever and `-shortest` then
+    stops at the only finite stream, i.e. the video.)
+    """
+
+    command = ["ffmpeg", "-y"]
+
+    if progress_callback is not None and total_duration:
+        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    command += [
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        "-af", "apad",
+        "-shortest",
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        output_path,
+    ]
+
+    logger.info("Running FFmpeg (audio replaced, video copied): %s", " ".join(command))
 
     await run_ffmpeg_with_progress(command, total_duration, progress_callback)
 
@@ -1664,8 +1737,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🎥 Send me a video and I'll send you a {SAMPLE_SECONDS:.0f}s sample plus an "
         "estimated size at each compression level before compressing.\n\n"
         "You can also just edit the audio of a video (boost volume, reduce "
-        "noise, enhance voice) without touching the picture — or send me an "
-        "audio recording directly.\n\n"
+        "noise, enhance voice) or replace its audio with a recording you send, "
+        "all without touching the picture — or send me an audio recording "
+        "directly.\n\n"
         "You can also forward a video to me.\n\n"
         "Use /setlevel to change which level is starred by default."
     )
@@ -1705,6 +1779,20 @@ async def handle_incoming(
         return
 
     chat_id = message.chat_id
+
+    # The user tapped "Replace audio" and this chat is now waiting for
+    # the recording: an audio file / voice message IS that recording.
+    waiting_for_message_id = awaiting_audio_replacement.get(chat_id)
+    if waiting_for_message_id is not None:
+        if media_type == "audio":
+            await process_audio_replacement(
+                update, context, file_id, waiting_for_message_id
+            )
+            return
+
+        # A video arrived instead — they've moved on, so forget the
+        # pending replacement and handle this as a normal new video.
+        awaiting_audio_replacement.pop(chat_id, None)
 
     # A new video replaces whatever we were holding open for a
     # previous PDF session in this chat — that's the only other
@@ -1822,6 +1910,8 @@ async def run_compression(
     volume_boost_percent: int = 0,
     noise_reduction: bool = False,
     voice_enhancement: bool = False,
+    replacement_audio_path: Path | None = None,
+    extra_caption: str = "",
 ) -> None:
     """
     level=None means "audio-only" — no video stream to compress, just
@@ -1831,13 +1921,20 @@ async def run_compression(
     level=AUDIO_EDIT_LEVEL means "just edit the audio of a video" — the
     video stream is copied untouched, only the audio is re-encoded, and
     the result is sent back as a video.
+
+    level=AUDIO_REPLACE_LEVEL means "swap the video's audio for the
+    recording at replacement_audio_path" — video copied untouched.
+    extra_caption (optional) is appended to the final video caption.
     """
 
     global active_compressions
 
     is_audio_only = level is None
     is_video_audio_edit = level == AUDIO_EDIT_LEVEL
-    level_info = None if (is_audio_only or is_video_audio_edit) else LEVELS[level]
+    is_video_audio_replace = level == AUDIO_REPLACE_LEVEL
+    level_info = (
+        None if (is_audio_only or is_video_audio_edit or is_video_audio_replace) else LEVELS[level]
+    )
     audio_info = AUDIO_LEVELS[audio_level]
     audio_bitrate = audio_info["bitrate"]
     output_path = work_dir / ("compressed.m4a" if is_audio_only else "compressed.mp4")
@@ -1917,6 +2014,10 @@ async def run_compression(
                         f"⚙️ Editing audio, video untouched "
                         f"({audio_info['label']}{boost_suffix}{enhancement_suffix})..."
                     )
+                elif is_video_audio_replace:
+                    compressing_label = (
+                        f"⚙️ Replacing the audio, video untouched ({audio_info['label']})..."
+                    )
                 else:
                     compressing_label = (
                         f"⚙️ Compressing at {level_info['label']} "
@@ -1990,6 +2091,15 @@ async def run_compression(
                         noise_reduction=noise_reduction,
                         voice_enhancement=voice_enhancement,
                     )
+                elif is_video_audio_replace:
+                    await replace_video_audio(
+                        str(input_path),
+                        str(replacement_audio_path),
+                        str(output_path),
+                        audio_bitrate,
+                        total_duration=duration,
+                        progress_callback=on_progress if duration else None,
+                    )
                 elif is_video_audio_edit:
                     await edit_video_audio(
                         str(input_path),
@@ -2056,13 +2166,17 @@ async def run_compression(
         has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
 
         await status_message.edit_text(
-            "📤 Sending edited video..." if is_video_audio_edit else "📤 Sending compressed video..."
+            "📤 Sending edited video..."
+            if (is_video_audio_edit or is_video_audio_replace)
+            else "📤 Sending compressed video..."
         )
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
         if is_video_audio_edit:
             result_heading = f"✅ Audio edited — video untouched! (audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})"
+        elif is_video_audio_replace:
+            result_heading = f"✅ Audio replaced — video untouched! (audio: {audio_info['label']})"
         else:
             result_heading = (
                 f"✅ Compression complete! ({level_info['label']}, "
@@ -2083,6 +2197,7 @@ async def run_compression(
                 f"Original: {format_size(original_size)}\n"
                 f"Compressed: {format_size(compressed_size)}\n"
                 f"Saved: {percentage:.1f}%"
+                + (f"\n\n{extra_caption}" if extra_caption else "")
             ),
             reply_markup=redo_keyboard(source_message_id),
         )
@@ -2106,6 +2221,101 @@ async def run_compression(
             # "redo" builds a fresh work_dir that was never registered
             # in pending_compressions, so just clean it up directly.
             cleanup_work_dir(work_dir)
+
+
+async def process_audio_replacement(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    target_message_id: int,
+) -> None:
+    """
+    The recording for a "Replace audio" request has arrived: download
+    it, sanity-check it has audio, and run the swap through the normal
+    compression pipeline (queue, progress bar, sending, cleanup).
+    """
+
+    message = update.effective_message
+    chat_id = message.chat_id
+
+    pending = pending_compressions.get(target_message_id)
+
+    if pending is None:
+        awaiting_audio_replacement.pop(chat_id, None)
+        await message.reply_text(
+            "⚠️ That video isn't in my cache anymore — please resend it, "
+            "then tap Replace audio again."
+        )
+        return
+
+    work_dir = pending["work_dir"]
+    audio_path = work_dir / f"replacement_{message.message_id}"
+
+    status_message = await message.reply_text("📥 Downloading the new audio...")
+
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+
+        telegram_file = await with_retries(context.bot.get_file, file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(audio_path))
+
+        has_audio, _ = await probe_audio_stream(str(audio_path))
+
+        if not has_audio:
+            audio_path.unlink(missing_ok=True)
+            # Still waiting — they can just send a different file.
+            await status_message.edit_text(
+                "❌ I couldn't find any audio in that file. "
+                "Send a different recording (or tap Cancel above)."
+            )
+            return
+
+        replacement_duration = await get_duration(str(audio_path))
+    except Exception as error:
+        logger.exception("Error downloading replacement audio:")
+        audio_path.unlink(missing_ok=True)
+        await status_message.edit_text(
+            f"❌ Couldn't download that audio — send it again.\n\nError: {error}"
+        )
+        return
+
+    # Got a usable recording — no longer waiting.
+    awaiting_audio_replacement.pop(chat_id, None)
+
+    video_duration = pending.get("duration")
+    extra_caption = ""
+
+    if replacement_duration and video_duration:
+        difference = replacement_duration - video_duration
+
+        if difference > 1:
+            extra_caption = (
+                f"ℹ️ Your recording ({format_duration(replacement_duration)}) is longer than "
+                f"the video ({format_duration(video_duration)}), so its last "
+                f"{format_duration(difference)} was cut."
+            )
+        elif difference < -1:
+            extra_caption = (
+                f"ℹ️ Your recording ({format_duration(replacement_duration)}) is shorter than "
+                f"the video ({format_duration(video_duration)}), so the last "
+                f"{format_duration(-difference)} is silent."
+            )
+
+    await run_compression(
+        update,
+        context,
+        pending["input_path"],
+        work_dir,
+        pending["original_size"],
+        AUDIO_REPLACE_LEVEL,
+        chat_id,
+        target_message_id,
+        status_message=status_message,
+        duration=video_duration,
+        audio_level=REPLACE_AUDIO_LEVEL,
+        replacement_audio_path=audio_path,
+        extra_caption=extra_caption,
+    )
 
 
 # ============================================================
@@ -2594,6 +2804,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Pick audio quality:",
             reply_markup=audio_keyboard(message_id, AUDIO_EDIT_LEVEL, audio_estimates, DEFAULT_AUDIO_LEVEL),
         )
+        return
+
+    if action == "audioreplace":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        awaiting_audio_replacement[chat_id] = message_id
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🔁 Send me the new audio now — a voice message, an audio file, "
+                "or an audio document.\n\n"
+                "It replaces the video's current audio; the picture stays exactly as it is. "
+                "The video decides the final length: a longer recording is cut at the end "
+                "of the video, a shorter one leaves the rest silent."
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data=f"audioreplacecancel:_:{message_id}")
+            ]]),
+        )
+        return
+
+    if action == "audioreplacecancel":
+        pending = pending_compressions.get(message_id)
+        chat_id = pending["chat_id"] if pending else query.message.chat_id
+
+        if awaiting_audio_replacement.get(chat_id) == message_id:
+            awaiting_audio_replacement.pop(chat_id, None)
+
+        try:
+            await query.edit_message_text(
+                "❌ Audio replacement cancelled — pick another option from the menu above."
+            )
+        except Exception:
+            await query.message.reply_text("❌ Audio replacement cancelled.")
         return
 
     if action == "audioset":
