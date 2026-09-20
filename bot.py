@@ -75,8 +75,12 @@ async def reject_unauthorized(message, user_id: int | None) -> None:
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "5"))
 RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "3"))
 
-# How many seconds of the video to sample when estimating size.
-SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "8"))
+# Length (seconds) of the sample clip encoded at EACH compression level.
+# The same clip is used two ways: to extrapolate the full-video size
+# estimate, and to send you a real preview of how that level looks
+# before you pick one. Longer = more accurate estimate and a better
+# preview, but the analyze step takes longer on a small CPU.
+SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "30"))
 
 # Caps FFmpeg's own thread usage so it doesn't try to use more
 # CPU than the service is actually allotted (helps avoid getting
@@ -217,6 +221,28 @@ DEFAULT_AUDIO_LEVEL = "medium"
 # audio quality + volume boost, same buttons/previews as the video
 # flow, just without a video-level step in front of them.
 AUDIO_ONLY_LEVEL = "audio_only"
+
+# Sentinel for a VIDEO input where the user only wants the audio
+# edited (quality / enhancements / volume boost). The video stream is
+# copied as-is (no re-encode), so it's fast and the picture is
+# untouched. Same audio buttons/previews as the other flows.
+AUDIO_EDIT_LEVEL = "audio_edit"
+
+
+def is_flow_level(level: str) -> bool:
+    """True for a real video level or either audio-flow sentinel."""
+    return level in LEVELS or level in (AUDIO_ONLY_LEVEL, AUDIO_EDIT_LEVEL)
+
+
+def flow_header(level: str, audio_level: str) -> str:
+    """One-line summary of what's been picked so far, shown above the audio menus."""
+    audio_label = AUDIO_LEVELS[audio_level]["label"]
+
+    if level == AUDIO_ONLY_LEVEL:
+        return f"🎧 Audio quality: {audio_label}"
+    if level == AUDIO_EDIT_LEVEL:
+        return f"🎧 Just editing audio (video untouched) · quality: {audio_label}"
+    return f"🎚️ {LEVELS[level]['label']} · audio: {audio_label}"
 
 # Audio file types accepted directly (message.audio/.voice) or as a
 # document upload — routes into the audio-only flow instead of the
@@ -539,6 +565,13 @@ def estimate_keyboard(message_id: int, estimates: dict[str, int | None], highlig
         ])
 
     rows.append([
+        InlineKeyboardButton(
+            "🎧 Just edit audio (keep video as is)",
+            callback_data=f"audioedit:_:{message_id}",
+        )
+    ])
+
+    rows.append([
         InlineKeyboardButton("📄 Extract to PDF", callback_data=f"pdfmenu:_:{message_id}")
     ])
 
@@ -746,6 +779,40 @@ async def get_video_dimensions(input_path: str) -> tuple[int | None, int | None]
         return int(width_str), int(height_str)
     except (ValueError, AttributeError):
         return None, None
+
+
+async def probe_audio_stream(input_path: str) -> tuple[bool, int | None]:
+    """
+    Returns (has_audio, bitrate_in_bits_per_second). The bitrate is
+    None when the file has audio but the container doesn't report a
+    per-stream bitrate (common with mkv/webm) — callers should treat
+    that as "unknown" rather than zero.
+    """
+
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=bit_rate",
+        "-of", "csv=p=0",
+        input_path,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe (audio) failed: %s", stderr.decode(errors="replace"))
+        return False, None
+
+    text = stdout.decode(errors="replace").strip()
+
+    if not text:
+        return False, None
+
+    try:
+        return True, int(text.splitlines()[0].strip().rstrip(","))
+    except ValueError:
+        return True, None
 
 
 async def generate_thumbnail(input_path: str, output_path: str, duration: float | None) -> bool:
@@ -961,6 +1028,54 @@ async def compress_audio_only(
     command.append(output_path)
 
     logger.info("Running FFmpeg (audio-only): %s", " ".join(command))
+
+    await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+
+
+async def edit_video_audio(
+    input_path: str,
+    output_path: str,
+    audio_bitrate: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+    volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+) -> None:
+    """
+    "Just edit audio" for a video: the video stream is copied
+    untouched (-c:v copy, so no quality loss and it finishes in
+    seconds), while the audio is re-encoded at the chosen bitrate with
+    any enabled noise reduction / voice enhancement / volume boost.
+    Only the first video and first audio stream are kept, so stray
+    subtitle/data streams can't break the mp4 mux.
+    """
+
+    command = ["ffmpeg", "-y"]
+
+    if progress_callback is not None and total_duration:
+        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    command += [
+        "-i", input_path,
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+    ]
+
+    audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
+    if audio_filter_chain:
+        command += ["-af", audio_filter_chain]
+
+    command += [
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        output_path,
+    ]
+
+    logger.info("Running FFmpeg (audio edit, video copied): %s", " ".join(command))
 
     await run_ffmpeg_with_progress(command, total_duration, progress_callback)
 
@@ -1280,22 +1395,25 @@ async def generate_volume_preview(
     return True
 
 
-async def estimate_level_size(
+async def make_level_sample(
     input_path: str,
     duration: float | None,
     level: str,
     work_dir: Path,
-) -> int | None:
+) -> tuple[int | None, Path | None]:
     """
-    Encode a short sample clip at this level and extrapolate the
-    full-length size from it. Returns None if estimation fails
-    (the level can still be picked — it just shows "unknown").
+    Encode a SAMPLE_SECONDS-long clip (from the middle of the video) at
+    this level. Returns (estimated_full_size, sample_path). The size is
+    extrapolated from the clip; the clip itself is KEPT on disk so it can
+    be sent as a preview — the caller is responsible for deleting it.
+    Returns (None, None) if the encode fails (the level can still be
+    picked — it just shows "unknown" and has no preview).
     """
 
     settings = LEVELS[level]
 
     if not duration or duration <= 0:
-        return None
+        return None, None
 
     sample_duration = min(SAMPLE_SECONDS, duration)
     seek = max(0.0, (duration - sample_duration) / 2)
@@ -1312,48 +1430,221 @@ async def estimate_level_size(
 
     returncode, stdout, stderr = await run_command(command)
 
-    try:
-        if returncode != 0 or not sample_path.exists():
-            logger.warning(
-                "Estimate sample failed for %s: %s",
-                level,
-                stderr.decode(errors="replace"),
-            )
-            return None
-
-        sample_size = sample_path.stat().st_size
-
-        if sample_duration <= 0:
-            return None
-
-        return int((sample_size / sample_duration) * duration)
-
-    finally:
+    if returncode != 0 or not sample_path.exists():
+        logger.warning(
+            "Sample encode failed for %s: %s",
+            level,
+            stderr.decode(errors="replace"),
+        )
         sample_path.unlink(missing_ok=True)
+        return None, None
+
+    sample_size = sample_path.stat().st_size
+
+    if sample_duration <= 0:
+        sample_path.unlink(missing_ok=True)
+        return None, None
+
+    return int((sample_size / sample_duration) * duration), sample_path
 
 
-async def estimate_all_levels(input_path: str, duration: float | None, work_dir: Path) -> dict[str, int | None]:
+async def sample_all_levels(
+    input_path: str,
+    duration: float | None,
+    work_dir: Path,
+    on_progress=None,
+) -> tuple[dict[str, int | None], dict[str, Path]]:
+    """
+    Runs make_level_sample for every level. Returns
+    (estimates, samples): estimates maps level -> estimated full size
+    (or None), samples maps level -> the kept sample clip (only for
+    levels that encoded successfully). on_progress(done, total), if
+    given, is awaited each time a level finishes.
+    """
+
     # Limit how many sample encodes run at once — 5 fully parallel
     # ffmpeg processes can spike CPU/RAM past tight resource limits.
     semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+    total = len(LEVEL_ORDER)
+    done_count = 0
 
-    async def bounded_estimate(level: str) -> int | None:
+    async def bounded_sample(level: str) -> tuple[int | None, Path | None]:
+        nonlocal done_count
+
         async with semaphore:
-            return await estimate_level_size(input_path, duration, level, work_dir)
+            result = await make_level_sample(input_path, duration, level, work_dir)
+
+        done_count += 1
+
+        if on_progress is not None:
+            try:
+                await on_progress(done_count, total)
+            except Exception:
+                # A progress-message hiccup shouldn't abort the encodes.
+                pass
+
+        return result
 
     results = await asyncio.gather(
-        *(bounded_estimate(level) for level in LEVEL_ORDER),
+        *(bounded_sample(level) for level in LEVEL_ORDER),
         return_exceptions=True,
     )
 
     estimates: dict[str, int | None] = {}
+    samples: dict[str, Path] = {}
 
     for level, result in zip(LEVEL_ORDER, results):
         if isinstance(result, Exception):
-            logger.warning("Estimate for %s raised: %s", level, result)
+            logger.warning("Sample for %s raised: %s", level, result)
             estimates[level] = None
         else:
-            estimates[level] = result
+            estimate, sample_path = result
+            estimates[level] = estimate
+            if sample_path is not None:
+                samples[level] = sample_path
+
+    return estimates, samples
+
+
+def sample_length_text(duration: float | None) -> str:
+    """'30s' normally, or the whole video's length if it's shorter than that."""
+    seconds = min(SAMPLE_SECONDS, duration) if duration else SAMPLE_SECONDS
+    return f"{seconds:.0f}s"
+
+
+async def send_level_samples(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    samples: dict[str, Path],
+    estimates: dict[str, int | None],
+    duration: float | None,
+) -> None:
+    """
+    Sends the sample clip for each compression level (lowest
+    compression first) so the user can actually watch the quality
+    difference before choosing. Each clip is deleted right after it's
+    sent. A failed send is logged and skipped — it never blocks the
+    level menu that follows.
+    """
+
+    if not samples:
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🎬 {sample_length_text(duration)} sample at each compression level "
+            "(taken from the middle of the video, with that level's default audio):"
+        ),
+    )
+
+    for level in LEVEL_ORDER:
+        sample_path = samples.get(level)
+
+        if sample_path is None:
+            continue
+
+        info = LEVELS[level]
+        thumb_path = sample_path.with_suffix(".jpg")
+
+        try:
+            sample_size = sample_path.stat().st_size
+            sample_duration = await get_duration(str(sample_path))
+            width, height = await get_video_dimensions(str(sample_path))
+            has_thumb = await generate_thumbnail(str(sample_path), str(thumb_path), sample_duration)
+
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+            await with_retries(
+                context.bot.send_video,
+                chat_id=chat_id,
+                video=str(sample_path),
+                supports_streaming=True,
+                width=width,
+                height=height,
+                duration=round(sample_duration) if sample_duration else None,
+                thumbnail=str(thumb_path) if has_thumb else None,
+                caption=(
+                    f"{info['label']} — {info['detail']}\n"
+                    f"Sample: {format_size(sample_size)} · "
+                    f"full video ≈ {format_size(estimates.get(level))}"
+                ),
+            )
+        except Exception:
+            logger.exception("Couldn't send %s sample clip", level)
+        finally:
+            sample_path.unlink(missing_ok=True)
+            thumb_path.unlink(missing_ok=True)
+
+
+async def analyze_and_show_level_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    status_message,
+    chat_id: int,
+    message_id: int,
+    input_path: Path,
+    duration: float | None,
+    work_dir: Path,
+    original_size: int | None,
+    pending: dict | None = None,
+) -> dict[str, int | None]:
+    """
+    Shared by "new video arrived" and "compress after PDF": encodes a
+    sample at every level, sends those samples as playable clips, then
+    posts the level menu (with size estimates) as a fresh message at the
+    bottom of the chat — so the buttons sit right under the clips
+    instead of scrolled away above them. Returns the estimates; also
+    stores them in `pending["estimates"]` if a pending dict is given.
+    """
+
+    sample_label = sample_length_text(duration)
+
+    async def on_progress(done: int, total: int) -> None:
+        await status_message.edit_text(
+            f"🔎 Encoding a {sample_label} sample at each compression level "
+            f"({done}/{total} done)...\n"
+            "This can take a minute or two on a small CPU."
+        )
+
+    await status_message.edit_text(
+        f"🔎 Encoding a {sample_label} sample at each compression level (0/{len(LEVEL_ORDER)} done)...\n"
+        "This can take a minute or two on a small CPU."
+    )
+
+    estimates, samples = await sample_all_levels(
+        str(input_path), duration, work_dir, on_progress=on_progress
+    )
+
+    if pending is not None:
+        pending["estimates"] = estimates
+
+    try:
+        await send_level_samples(context, chat_id, samples, estimates, duration)
+    finally:
+        # Anything not sent (e.g. an exception mid-way) shouldn't linger.
+        for leftover in samples.values():
+            leftover.unlink(missing_ok=True)
+
+    default_level = get_default_level(chat_id)
+
+    lines = [f"Original size: {format_size(original_size)}", ""]
+    for level in LEVEL_ORDER:
+        info = LEVELS[level]
+        lines.append(f"{info['label']} — ~{format_size(estimates.get(level))} · {info['detail']}")
+
+    lines.append("")
+    lines.append(f"Estimates are based on the {sample_label} samples and may vary ±15%.")
+    lines.append("Pick a level to compress:")
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        reply_markup=estimate_keyboard(message_id, estimates, default_level),
+    )
+
+    # The old "encoding..." status message has done its job.
+    with contextlib.suppress(Exception):
+        await status_message.delete()
 
     return estimates
 
@@ -1370,8 +1661,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        "🎥 Send me a video and I'll show you estimated sizes at a "
-        "few compression levels before compressing.\n\n"
+        f"🎥 Send me a video and I'll send you a {SAMPLE_SECONDS:.0f}s sample plus an "
+        "estimated size at each compression level before compressing.\n\n"
+        "You can also just edit the audio of a video (boost volume, reduce "
+        "noise, enhance voice) without touching the picture — or send me an "
+        "audio recording directly.\n\n"
         "You can also forward a video to me.\n\n"
         "Use /setlevel to change which level is starred by default."
     )
@@ -1478,42 +1772,30 @@ async def handle_incoming(
             )
             return
 
-        await status_message.edit_text(
-            f"🔎 Analyzing video ({format_size(downloaded_size)})...\n"
-            "Estimating size at each compression level, one moment..."
-        )
+        # Registered BEFORE the samples are encoded/sent so the menu
+        # buttons that appear afterwards always find their pending entry.
+        pending_entry = {
+            "input_path": input_path,
+            "work_dir": work_dir,
+            "original_size": downloaded_size,
+            "filename": filename,
+            "chat_id": chat_id,
+            "duration": duration,
+            "estimates": {},
+            "media_type": "video",
+        }
+        remember_pending(message.message_id, pending_entry)
 
-        estimates = await estimate_all_levels(str(input_path), duration, work_dir)
-
-        remember_pending(
-            message.message_id,
-            {
-                "input_path": input_path,
-                "work_dir": work_dir,
-                "original_size": downloaded_size,
-                "filename": filename,
-                "chat_id": chat_id,
-                "duration": duration,
-                "estimates": estimates,
-                "media_type": "video",
-            },
-        )
-
-        default_level = get_default_level(chat_id)
-
-        lines = [f"Original size: {format_size(downloaded_size)}", ""]
-        for level in LEVEL_ORDER:
-            info = LEVELS[level]
-            est = estimates.get(level)
-            lines.append(f"{info['label']} — ~{format_size(est)} · {info['detail']}")
-
-        lines.append("")
-        lines.append("Estimates are based on a short sample and may vary ±15%.")
-        lines.append("Pick a level to compress:")
-
-        await status_message.edit_text(
-            "\n".join(lines),
-            reply_markup=estimate_keyboard(message.message_id, estimates, default_level),
+        await analyze_and_show_level_menu(
+            context,
+            status_message=status_message,
+            chat_id=chat_id,
+            message_id=message.message_id,
+            input_path=input_path,
+            duration=duration,
+            work_dir=work_dir,
+            original_size=downloaded_size,
+            pending=pending_entry,
         )
 
     except Exception as error:
@@ -1545,12 +1827,17 @@ async def run_compression(
     level=None means "audio-only" — no video stream to compress, just
     re-encode the audio at the chosen quality/boost and send it back
     as an audio file instead of a video.
+
+    level=AUDIO_EDIT_LEVEL means "just edit the audio of a video" — the
+    video stream is copied untouched, only the audio is re-encoded, and
+    the result is sent back as a video.
     """
 
     global active_compressions
 
     is_audio_only = level is None
-    level_info = None if is_audio_only else LEVELS[level]
+    is_video_audio_edit = level == AUDIO_EDIT_LEVEL
+    level_info = None if (is_audio_only or is_video_audio_edit) else LEVELS[level]
     audio_info = AUDIO_LEVELS[audio_level]
     audio_bitrate = audio_info["bitrate"]
     output_path = work_dir / ("compressed.m4a" if is_audio_only else "compressed.mp4")
@@ -1621,12 +1908,20 @@ async def run_compression(
                     enhancement_bits.append("🎙 voice enhancement")
                 enhancement_suffix = f" · {' + '.join(enhancement_bits)}" if enhancement_bits else ""
 
-                compressing_label = (
-                    f"⚙️ Compressing audio ({audio_info['label']}{boost_suffix}{enhancement_suffix})..."
-                    if is_audio_only else
-                    f"⚙️ Compressing at {level_info['label']} "
-                    f"(audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})..."
-                )
+                if is_audio_only:
+                    compressing_label = (
+                        f"⚙️ Compressing audio ({audio_info['label']}{boost_suffix}{enhancement_suffix})..."
+                    )
+                elif is_video_audio_edit:
+                    compressing_label = (
+                        f"⚙️ Editing audio, video untouched "
+                        f"({audio_info['label']}{boost_suffix}{enhancement_suffix})..."
+                    )
+                else:
+                    compressing_label = (
+                        f"⚙️ Compressing at {level_info['label']} "
+                        f"(audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})..."
+                    )
                 text = f"{compressing_label}\n{render_progress_bar(0)}"
 
                 if status_message is not None:
@@ -1695,6 +1990,17 @@ async def run_compression(
                         noise_reduction=noise_reduction,
                         voice_enhancement=voice_enhancement,
                     )
+                elif is_video_audio_edit:
+                    await edit_video_audio(
+                        str(input_path),
+                        str(output_path),
+                        audio_bitrate,
+                        total_duration=duration,
+                        progress_callback=on_progress if duration else None,
+                        volume_boost_percent=volume_boost_percent,
+                        noise_reduction=noise_reduction,
+                        voice_enhancement=voice_enhancement,
+                    )
                 else:
                     await compress_video(
                         str(input_path),
@@ -1749,9 +2055,19 @@ async def run_compression(
         thumbnail_path = work_dir / "thumb.jpg"
         has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
 
-        await status_message.edit_text("📤 Sending compressed video...")
+        await status_message.edit_text(
+            "📤 Sending edited video..." if is_video_audio_edit else "📤 Sending compressed video..."
+        )
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+        if is_video_audio_edit:
+            result_heading = f"✅ Audio edited — video untouched! (audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})"
+        else:
+            result_heading = (
+                f"✅ Compression complete! ({level_info['label']}, "
+                f"audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})"
+            )
 
         await with_retries(
             context.bot.send_video,
@@ -1763,7 +2079,7 @@ async def run_compression(
             duration=round(output_duration) if output_duration else None,
             thumbnail=str(thumbnail_path) if has_thumbnail else None,
             caption=(
-                f"✅ Compression complete! ({level_info['label']}, audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})\n\n"
+                f"{result_heading}\n\n"
                 f"Original: {format_size(original_size)}\n"
                 f"Compressed: {format_size(compressed_size)}\n"
                 f"Saved: {percentage:.1f}%"
@@ -2195,32 +2511,88 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         duration = pending.get("duration")
         chat_id = pending["chat_id"]
 
-        await query.edit_message_text("🔎 Estimating size at each compression level...")
+        # The "Compress video" button can sit on the PDF *document*
+        # message (after "auto-delete similar frames"), and a document
+        # has no text to edit — editing it raises an error that used to
+        # be swallowed silently, so nothing appeared to happen. So
+        # instead of editing the tapped message, drop its buttons (stops
+        # double-taps) and post a fresh status message to work with.
+        with contextlib.suppress(Exception):
+            await query.edit_message_reply_markup(reply_markup=None)
 
-        estimates = await estimate_all_levels(str(input_path), duration, work_dir)
-        pending["estimates"] = estimates
-        default_level = get_default_level(chat_id)
+        status_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text="🔎 Getting samples ready...",
+        )
 
-        lines = [f"Original size: {format_size(pending['original_size'])}", ""]
-        for level_key in LEVEL_ORDER:
-            info = LEVELS[level_key]
-            est = estimates.get(level_key)
-            lines.append(f"{info['label']} — ~{format_size(est)} · {info['detail']}")
-
-        lines.append("")
-        lines.append("Estimates are based on a short sample and may vary ±15%.")
-        lines.append("Pick a level to compress:")
-
-        await query.edit_message_text(
-            "\n".join(lines),
-            reply_markup=estimate_keyboard(message_id, estimates, default_level),
+        await analyze_and_show_level_menu(
+            context,
+            status_message=status_message,
+            chat_id=chat_id,
+            message_id=message_id,
+            input_path=input_path,
+            duration=duration,
+            work_dir=work_dir,
+            original_size=pending["original_size"],
+            pending=pending,
         )
         return
 
     if action == "pdffinish":
         clear_pending(message_id)
+
+        finished_text = "✅ Session finished — the stored video and temporary files were deleted."
+
+        try:
+            await query.edit_message_text(finished_text)
+        except Exception:
+            # Tapped from the PDF document message (no text to edit):
+            # remove its buttons and post the confirmation instead.
+            with contextlib.suppress(Exception):
+                await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text(finished_text)
+        return
+
+    if action == "audioedit":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        has_audio, source_audio_bitrate = await probe_audio_stream(str(pending["input_path"]))
+
+        if not has_audio:
+            await query.message.reply_text(
+                "⚠️ This video has no audio track, so there's nothing to edit. "
+                "Pick a compression level above instead."
+            )
+            return
+
+        duration = pending.get("duration")
+        original_size = pending.get("original_size")
+
+        # The video is copied untouched, so the result is roughly:
+        # original size - the original audio track + the new audio track.
+        source_audio_bytes = (
+            int(source_audio_bitrate * duration / 8)
+            if source_audio_bitrate and duration else None
+        )
+
+        audio_estimates: dict[str, int | None] = {}
+        for audio_key in AUDIO_LEVEL_ORDER:
+            new_audio_bytes = estimate_audio_bytes(AUDIO_LEVELS[audio_key]["bitrate"], duration)
+            if original_size and source_audio_bytes is not None and new_audio_bytes is not None:
+                audio_estimates[audio_key] = max(0, original_size - source_audio_bytes) + new_audio_bytes
+            else:
+                audio_estimates[audio_key] = None
+
         await query.edit_message_text(
-            "✅ Session finished — the stored video and temporary files were deleted."
+            "🎧 Just editing the audio — the video stays exactly as it is (no re-encode).\n"
+            "Pick audio quality:",
+            reply_markup=audio_keyboard(message_id, AUDIO_EDIT_LEVEL, audio_estimates, DEFAULT_AUDIO_LEVEL),
         )
         return
 
@@ -2230,9 +2602,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             return
 
-        is_audio_only = chosen_level == AUDIO_ONLY_LEVEL
-
-        if (not is_audio_only and chosen_level not in LEVELS) or chosen_audio not in AUDIO_LEVELS:
+        if not is_flow_level(chosen_level) or chosen_audio not in AUDIO_LEVELS:
             return
 
         pending = pending_compressions.get(message_id)
@@ -2243,11 +2613,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
-        header = (
-            f"🎧 Audio quality: {AUDIO_LEVELS[chosen_audio]['label']}"
-            if is_audio_only else
-            f"🎚️ {LEVELS[chosen_level]['label']} · audio: {AUDIO_LEVELS[chosen_audio]['label']}"
-        )
+        header = flow_header(chosen_level, chosen_audio)
 
         await query.edit_message_text(
             f"{header}\n🎛 Optional audio enhancements — toggle, then continue:",
@@ -2263,16 +2629,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except (ValueError, IndexError):
             return
 
-        is_audio_only = chosen_level == AUDIO_ONLY_LEVEL
-
-        if (not is_audio_only and chosen_level not in LEVELS) or chosen_audio not in AUDIO_LEVELS:
+        if not is_flow_level(chosen_level) or chosen_audio not in AUDIO_LEVELS:
             return
 
-        header = (
-            f"🎧 Audio quality: {AUDIO_LEVELS[chosen_audio]['label']}"
-            if is_audio_only else
-            f"🎚️ {LEVELS[chosen_level]['label']} · audio: {AUDIO_LEVELS[chosen_audio]['label']}"
-        )
+        header = flow_header(chosen_level, chosen_audio)
 
         await query.edit_message_text(
             f"{header}\n🎛 Optional audio enhancements — toggle, then continue:",
@@ -2290,9 +2650,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except (ValueError, IndexError):
             return
 
-        is_audio_only = chosen_level == AUDIO_ONLY_LEVEL
-
-        if (not is_audio_only and chosen_level not in LEVELS) or chosen_audio not in AUDIO_LEVELS:
+        if not is_flow_level(chosen_level) or chosen_audio not in AUDIO_LEVELS:
             return
 
         pending = pending_compressions.get(message_id)
@@ -2379,10 +2737,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except (ValueError, IndexError):
             return
 
-        is_audio_only = chosen_level == AUDIO_ONLY_LEVEL
-
         if (
-            (not is_audio_only and chosen_level not in LEVELS)
+            not is_flow_level(chosen_level)
             or chosen_audio not in AUDIO_LEVELS
             or boost not in VOLUME_BOOST_OPTIONS
         ):
@@ -2401,7 +2757,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             input_path=pending["input_path"],
             work_dir=pending["work_dir"],
             original_size=pending["original_size"],
-            level=None if is_audio_only else chosen_level,
+            level=None if chosen_level == AUDIO_ONLY_LEVEL else chosen_level,
             chat_id=pending["chat_id"],
             source_message_id=message_id,
             status_message=query.message,
