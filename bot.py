@@ -1,10 +1,12 @@
 import os
+import json
 import asyncio
 import logging
 import shutil
 import tempfile
 import time
 import contextlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 import img2pdf
@@ -38,12 +40,38 @@ TELEGRAM_API_URL = os.getenv(
 TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
 
 # ------------------------------------------------------------
-# Access control — hard-coded on purpose (not an env var) so the
-# allowlist lives in the repo, not in Railway config. Add your
-# numeric Telegram user ID(s) here. You can get your own ID by
-# messaging @userinfobot on Telegram, or just try using this bot
-# once — it will reply with your ID so you can copy it in here.
+# Access control
+#
+# Three ways a user gets in:
+#   1. ADMIN_USER_ID below — always allowed, and the only person who
+#      can approve/deny others.
+#   2. ALLOWED_USER_IDS — hard-coded in the repo (the original list).
+#   3. Approved users — anyone the admin taps "Accept" for. Someone
+#      who isn't allowed just messages the bot; the admin gets a
+#      request (name, username, ID) with Accept / Deny buttons. Accepted
+#      IDs are saved in APPROVED_USERS_FILE (a .json file), and after
+#      every change the bot posts the full list as a new .json file in
+#      the private BACKUP CHANNEL and PINS it.
+#
+# Railway wipes local files on every redeploy (no Volume needed here):
+# when the bot starts it reads the file pinned in the backup channel and
+# loads the approved list from it, so the pinned file IS the backup.
 # ------------------------------------------------------------
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "940770584"))
+
+# The private channel where the approved-users .json is posted + pinned.
+# It must be a channel the bot is an ADMIN of, with the "Post messages"
+# and "Pin messages" rights. Channel IDs look like -1001234567890.
+# Paste it here or set the BACKUP_CHANNEL_ID variable in Railway.
+# (To find it: forward any TEXT post from the channel to this bot, from
+# the admin account — it replies with the ID.) While it's 0/unset the
+# file is sent to the admin's private chat instead and nothing is pinned.
+BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
+
+APPROVED_USERS_FILE = Path(
+    os.getenv("APPROVED_USERS_FILE", str(Path(__file__).resolve().parent / "approved_users.json"))
+)
+
 ALLOWED_USER_IDS: set[int] = {
     940770584,
    5879238618,
@@ -54,21 +82,519 @@ ALLOWED_USER_IDS: set[int] = {
     2112316128,
     7504848343,
     5131223597,
-    # <- replace with your Telegram user ID
-    # 222222222,  # <- add more IDs here if needed
 }
+
+# user_id -> {"name": str, "username": str | None, "approved_at": iso str}
+approved_users: dict[int, dict] = {}
+
+# Requests waiting on the admin's decision (user_id -> info). Kept in
+# memory only: after a restart the user just tries again.
+pending_access_requests: dict[int, dict] = {}
+
+# Users the admin denied this session — remembered so they can't spam
+# the admin with new requests (the admin can still flip it to Accept
+# from the original request message).
+denied_users: set[int] = set()
+
+# user_id -> last time we told them "still waiting"/"denied", so a
+# burst of messages (e.g. an album of videos) gets one reply, not ten.
+_last_access_notice: dict[int, float] = {}
+ACCESS_NOTICE_COOLDOWN_SECONDS = 60
 
 
 def is_allowed(user_id: int | None) -> bool:
-    return user_id is not None and user_id in ALLOWED_USER_IDS
+    if user_id is None:
+        return False
+
+    return (
+        user_id == ADMIN_USER_ID
+        or user_id in ALLOWED_USER_IDS
+        or user_id in approved_users
+    )
+
+
+def is_admin(user_id: int | None) -> bool:
+    return user_id is not None and user_id == ADMIN_USER_ID
+
+
+def user_display_name(user) -> str:
+    """'First Last' from a Telegram user object (falls back to 'Unknown')."""
+    parts = [getattr(user, "first_name", None), getattr(user, "last_name", None)]
+    name = " ".join(part for part in parts if part)
+    return name or "Unknown"
+
+
+def format_username(username: str | None) -> str:
+    return f"@{username}" if username else "none"
+
+
+def approved_users_payload() -> dict:
+    return {
+        "approved_users": [
+            {"id": user_id, **info}
+            for user_id, info in sorted(approved_users.items())
+        ]
+    }
+
+
+def approved_users_json_bytes() -> bytes:
+    return json.dumps(approved_users_payload(), indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def save_approved_users() -> bool:
+    """Write the approved list to disk (atomically). Returns False if it couldn't."""
+    try:
+        APPROVED_USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = APPROVED_USERS_FILE.with_suffix(".json.tmp")
+        temp_path.write_bytes(approved_users_json_bytes())
+        os.replace(temp_path, APPROVED_USERS_FILE)
+        return True
+    except OSError:
+        logger.exception("Could not save %s", APPROVED_USERS_FILE)
+        return False
+
+
+def merge_approved_users(raw: bytes) -> int:
+    """
+    Merge users from JSON bytes into approved_users. Accepts the file
+    this bot sends ({"approved_users": [{"id": ..., ...}]}) or a bare
+    list of IDs / user objects. Returns how many NEW users were added.
+    Raises ValueError if the content isn't usable.
+    """
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"not valid JSON ({error})") from error
+
+    entries = data.get("approved_users") if isinstance(data, dict) else data
+
+    if not isinstance(entries, list):
+        raise ValueError('expected {"approved_users": [...]} or a list of IDs')
+
+    added = 0
+
+    for entry in entries:
+        if isinstance(entry, dict):
+            raw_id, info = entry.get("id"), {k: v for k, v in entry.items() if k != "id"}
+        else:
+            raw_id, info = entry, {}
+
+        try:
+            user_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+
+        if user_id not in approved_users:
+            added += 1
+
+        approved_users[user_id] = {
+            "name": info.get("name") or approved_users.get(user_id, {}).get("name") or "Unknown",
+            "username": info.get("username") or approved_users.get(user_id, {}).get("username"),
+            "approved_at": info.get("approved_at")
+            or approved_users.get(user_id, {}).get("approved_at")
+            or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+
+    return added
+
+
+def load_approved_users() -> None:
+    """Load the saved approved list at startup (missing file = empty list)."""
+    if not APPROVED_USERS_FILE.exists():
+        logger.info("No %s yet — starting with no approved users.", APPROVED_USERS_FILE)
+        return
+
+    try:
+        merge_approved_users(APPROVED_USERS_FILE.read_bytes())
+        logger.info("Loaded %d approved user(s) from %s", len(approved_users), APPROVED_USERS_FILE)
+    except (OSError, ValueError):
+        logger.exception("Couldn't read %s — starting with no approved users.", APPROVED_USERS_FILE)
+
+
+def access_request_text(user_id: int, info: dict, status: str | None = None) -> str:
+    lines = [
+        "🔔 Access request" if status is None else "🔔 Access request — decided",
+        "",
+        f"👤 Name: {info.get('name') or 'Unknown'}",
+        f"🔗 Username: {format_username(info.get('username'))}",
+        f"🆔 ID: {user_id}",
+    ]
+
+    if status:
+        lines += ["", status]
+
+    return "\n".join(lines)
+
+
+def access_request_keyboard(user_id: int, state: str = "pending") -> InlineKeyboardMarkup:
+    """state: 'pending' (Accept/Deny), 'accepted' (Revoke), 'denied' (Accept instead)."""
+    if state == "accepted":
+        rows = [[InlineKeyboardButton("🚫 Revoke access", callback_data=f"access:revoke:{user_id}")]]
+    elif state == "denied":
+        rows = [[InlineKeyboardButton("✅ Accept instead", callback_data=f"access:accept:{user_id}")]]
+    elif state == "revoked":
+        rows = [[InlineKeyboardButton("✅ Accept again", callback_data=f"access:accept:{user_id}")]]
+    else:
+        rows = [[
+            InlineKeyboardButton("✅ Accept", callback_data=f"access:accept:{user_id}"),
+            InlineKeyboardButton("❌ Deny", callback_data=f"access:deny:{user_id}"),
+        ]]
+
+    return InlineKeyboardMarkup(rows)
 
 
 async def reject_unauthorized(message, user_id: int | None) -> None:
+    """
+    Someone who isn't allowed tried to use the bot. Instead of a dead
+    end, forward a request (name, username, ID + Accept/Deny buttons)
+    to the admin — once; repeat attempts while it's pending just get a
+    short "still waiting" reply.
+    """
+    if user_id is None:
+        return
+
+    now = time.monotonic()
+
+    def should_notify_user() -> bool:
+        last = _last_access_notice.get(user_id, 0.0)
+        if now - last < ACCESS_NOTICE_COOLDOWN_SECONDS:
+            return False
+        _last_access_notice[user_id] = now
+        return True
+
+    if user_id in denied_users:
+        if should_notify_user():
+            await message.reply_text("🔴 Your access request was declined.")
+        return
+
+    if user_id in pending_access_requests:
+        if should_notify_user():
+            await message.reply_text(
+                "⏳ Your request is still waiting for the admin's approval. "
+                "You'll get a message here as soon as they decide."
+            )
+        return
+
+    user = message.from_user
+    info = {
+        "name": user_display_name(user),
+        "username": getattr(user, "username", None),
+    }
+
+    try:
+        await message.get_bot().send_message(
+            chat_id=ADMIN_USER_ID,
+            text=access_request_text(user_id, info),
+            reply_markup=access_request_keyboard(user_id),
+        )
+    except Exception:
+        logger.exception("Couldn't send the access request for %s to the admin", user_id)
+        if should_notify_user():
+            await message.reply_text(
+                "⚠️ I couldn't reach the admin to ask for you right now — please try again later."
+            )
+        return
+
+    pending_access_requests[user_id] = {**info, "requested_at": now}
+    _last_access_notice[user_id] = now
+
     await message.reply_text(
-        "⛔ You're not authorized to use this bot.\n\n"
-        f"Your Telegram user ID is: {user_id}\n"
-        "If this is your account, add that number to ALLOWED_USER_IDS in bot.py."
+        "⛔ You're not approved to use this bot yet.\n\n"
+        "I've sent your request to the admin — you'll get a message here "
+        "when they decide."
     )
+
+
+async def send_approved_users_file(bot, caption: str) -> None:
+    """
+    Post the current full approved-users list as a .json file: into the
+    backup channel (and pin it there) if one is configured, otherwise —
+    or if the channel post fails — into the admin's private chat so the
+    file is never lost.
+    """
+    payload = approved_users_json_bytes()
+
+    if not BACKUP_CHANNEL_ID:
+        await bot.send_document(
+            chat_id=ADMIN_USER_ID,
+            document=payload,
+            filename="approved_users.json",
+            caption=caption,
+        )
+        return
+
+    try:
+        sent = await bot.send_document(
+            chat_id=BACKUP_CHANNEL_ID,
+            document=payload,
+            filename="approved_users.json",
+            caption=caption,
+        )
+    except Exception as error:
+        logger.exception("Couldn't post the backup file to channel %s", BACKUP_CHANNEL_ID)
+        await bot.send_document(
+            chat_id=ADMIN_USER_ID,
+            document=payload,
+            filename="approved_users.json",
+            caption=(
+                f"{caption}\n\n⚠️ I couldn't post this to the backup channel "
+                f"({BACKUP_CHANNEL_ID}): {error}\n"
+                "Make sure the bot is an admin there and the ID is right."
+            ),
+        )
+        return
+
+    await pin_backup_file(bot, sent)
+
+
+async def pin_backup_file(bot, sent_message) -> None:
+    """
+    Pin the freshly posted backup file, then unpin the previous backup
+    file (if any) so the pinned message is always the newest list. The
+    new one is pinned FIRST, so a failure can never leave the channel
+    with no pinned backup.
+    """
+    old_message_id = None
+
+    try:
+        chat = await bot.get_chat(BACKUP_CHANNEL_ID)
+        old = getattr(chat, "pinned_message", None)
+        old_document = getattr(old, "document", None) if old is not None else None
+
+        if (
+            old is not None
+            and old.message_id != sent_message.message_id
+            and old_document is not None
+            and (old_document.file_name or "").lower().endswith(".json")
+        ):
+            old_message_id = old.message_id
+    except Exception:
+        logger.warning("Couldn't look up the previously pinned backup in %s", BACKUP_CHANNEL_ID)
+
+    try:
+        await bot.pin_chat_message(
+            chat_id=BACKUP_CHANNEL_ID,
+            message_id=sent_message.message_id,
+            disable_notification=True,
+        )
+    except Exception:
+        logger.exception("Couldn't pin the backup file in %s", BACKUP_CHANNEL_ID)
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    "⚠️ I posted the backup file in the channel but couldn't pin it. "
+                    "Give the bot the \"Pin messages\" admin right there — the pinned "
+                    "file is what I reload the approved list from after a redeploy."
+                ),
+            )
+        except Exception:
+            pass
+        return
+
+    if old_message_id is not None:
+        try:
+            await bot.unpin_chat_message(chat_id=BACKUP_CHANNEL_ID, message_id=old_message_id)
+        except Exception:
+            logger.warning("Couldn't unpin the previous backup (message %s)", old_message_id)
+
+
+async def restore_from_pinned_backup(bot) -> None:
+    """
+    At startup: read the .json pinned in the backup channel and merge its
+    users into the approved list. This is what makes the pinned file a
+    real backup — Railway wipes the local file on every redeploy.
+    """
+    if not BACKUP_CHANNEL_ID:
+        return
+
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    temp_path = Path(TEMP_DIR) / "pinned_backup.json"
+
+    try:
+        chat = await bot.get_chat(BACKUP_CHANNEL_ID)
+        pinned = getattr(chat, "pinned_message", None)
+        document = getattr(pinned, "document", None) if pinned is not None else None
+
+        if document is None:
+            logger.info("No pinned backup file in channel %s — nothing to restore.", BACKUP_CHANNEL_ID)
+            return
+
+        telegram_file = await with_retries(bot.get_file, document.file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(temp_path))
+
+        added = merge_approved_users(temp_path.read_bytes())
+        save_approved_users()
+
+        logger.info(
+            "Restored from the pinned backup: %d new user(s), %d approved in total.",
+            added, len(approved_users),
+        )
+
+        if added:
+            await bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    f"♻️ Bot restarted — loaded {added} approved user(s) from the pinned "
+                    f"backup in your channel ({len(approved_users)} approved in total)."
+                ),
+            )
+    except Exception:
+        logger.exception("Couldn't restore the approved users from the pinned backup.")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+async def post_init(application: Application) -> None:
+    await restore_from_pinned_backup(application.bot)
+
+
+async def report_forwarded_channel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin forwards a text post from a channel -> reply with that channel's ID."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    origin_chat = getattr(getattr(message, "forward_origin", None), "chat", None)
+
+    if origin_chat is None or getattr(origin_chat, "type", None) != "channel":
+        return
+
+    await message.reply_text(
+        f"📢 That channel's ID is:\n{origin_chat.id}\n\n"
+        "Set it as BACKUP_CHANNEL_ID (Railway variable, or in bot.py) and make "
+        "sure the bot is an admin of the channel with the \"Post messages\" and "
+        "\"Pin messages\" rights."
+    )
+
+
+async def resolve_user_info(bot, user_id: int) -> dict:
+    """Best-effort name/username for a user we no longer have a pending entry for (e.g. after a restart)."""
+    known = pending_access_requests.get(user_id) or approved_users.get(user_id)
+    if known:
+        return {"name": known.get("name"), "username": known.get("username")}
+
+    try:
+        chat = await bot.get_chat(user_id)
+        return {"name": user_display_name(chat), "username": getattr(chat, "username", None)}
+    except Exception:
+        return {"name": f"User {user_id}", "username": None}
+
+
+async def handle_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin tapped Accept / Deny / Revoke on an access-request message."""
+    query = update.callback_query
+
+    if query is None or query.data is None:
+        return
+
+    if not is_admin(query.from_user.id if query.from_user else None):
+        await query.answer("Only the admin can do this.", show_alert=True)
+        return
+
+    try:
+        _, decision, user_id_text = query.data.split(":", 2)
+        user_id = int(user_id_text)
+    except ValueError:
+        await query.answer()
+        return
+
+    if decision not in ("accept", "deny", "revoke"):
+        await query.answer()
+        return
+
+    bot = context.bot
+    info = await resolve_user_info(bot, user_id)
+
+    async def update_request_message(status: str, state: str) -> None:
+        try:
+            await query.edit_message_text(
+                access_request_text(user_id, info, status),
+                reply_markup=access_request_keyboard(user_id, state),
+            )
+        except Exception:
+            logger.exception("Couldn't edit the access request message for %s", user_id)
+
+    async def tell_user(text: str) -> None:
+        try:
+            await bot.send_message(chat_id=user_id, text=text)
+        except Exception:
+            # They may have blocked the bot or never opened the chat.
+            logger.warning("Couldn't notify user %s about their access decision", user_id)
+
+    if decision == "accept":
+        approved_users[user_id] = {
+            "name": info.get("name") or "Unknown",
+            "username": info.get("username"),
+            "approved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        pending_access_requests.pop(user_id, None)
+        denied_users.discard(user_id)
+        _last_access_notice.pop(user_id, None)
+
+        save_approved_users()
+
+        await query.answer("Accepted ✅")
+        await update_request_message("✅ Accepted", "accepted")
+        await tell_user(
+            "🟢 Green card granted! The admin approved you — you can use the bot now.\n\n"
+            "Send me a video or an audio recording to get started."
+        )
+        await send_approved_users_file(
+            bot,
+            f"✅ {info.get('name') or user_id} approved — {len(approved_users)} approved user(s) in total.",
+        )
+        return
+
+    if decision == "deny":
+        pending_access_requests.pop(user_id, None)
+        denied_users.add(user_id)
+
+        await query.answer("Denied ❌")
+        await update_request_message("❌ Denied", "denied")
+        await tell_user("🔴 Your request to use this bot was declined.")
+        return
+
+    # revoke
+    if user_id in ALLOWED_USER_IDS or user_id == ADMIN_USER_ID:
+        await query.answer(
+            "That user is hard-coded in bot.py, so it can't be revoked here.",
+            show_alert=True,
+        )
+        return
+
+    approved_users.pop(user_id, None)
+    denied_users.add(user_id)
+
+    save_approved_users()
+
+    await query.answer("Access revoked 🚫")
+    await update_request_message("🚫 Access revoked", "revoked")
+    await tell_user("🔴 Your access to this bot was removed by the admin.")
+    await send_approved_users_file(
+        bot,
+        f"🚫 {info.get('name') or user_id} removed — {len(approved_users)} approved user(s) left.",
+    )
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/users (admin only): send the current approved-users .json on demand."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    await context.bot.send_document(
+        chat_id=ADMIN_USER_ID,
+        document=approved_users_json_bytes(),
+        filename="approved_users.json",
+        caption=f"📋 {len(approved_users)} approved user(s) right now. "
+        "(To load a list manually, just send a .json file back to me.)",
+    )
+
 
 # How many times to retry a flaky network call (download/upload)
 # before giving up, and the base delay between attempts.
@@ -2386,6 +2912,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     mime_type = document.mime_type or ""
     filename = document.file_name or "video"
 
+    # The admin sending back an approved_users .json restores/merges
+    # the approved list (e.g. after Railway wiped the local file).
+    if is_admin(user_id) and filename.lower().endswith(".json"):
+        await restore_approved_users_from_document(message, context, document)
+        return
+
     is_video = (
         mime_type.startswith("video/")
         or filename.lower().endswith(
@@ -2410,6 +2942,32 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         filename=filename,
         media_type="audio" if is_audio else "video",
     )
+
+
+async def restore_approved_users_from_document(message, context, document) -> None:
+    """Admin sent a .json: merge its users into the approved list and save."""
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    temp_path = Path(TEMP_DIR) / f"restore_{message.message_id}.json"
+
+    try:
+        telegram_file = await with_retries(context.bot.get_file, document.file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(temp_path))
+
+        added = merge_approved_users(temp_path.read_bytes())
+        saved = save_approved_users()
+
+        await message.reply_text(
+            f"✅ Loaded that file — {added} new user(s) added, "
+            f"{len(approved_users)} approved in total."
+            + ("" if saved else "\n⚠️ Couldn't save to disk on the server.")
+        )
+    except ValueError as error:
+        await message.reply_text(f"❌ I couldn't use that JSON file: {error}")
+    except Exception as error:
+        logger.exception("Error restoring approved users:")
+        await message.reply_text(f"❌ Something went wrong reading that file.\n\nError: {error}")
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 # ============================================================
@@ -3114,6 +3672,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     logger.info("Starting Telegram Video Compressor...")
+    load_approved_users()
     logger.info("Local Bot API URL: %s", TELEGRAM_API_URL)
 
     application = (
@@ -3131,14 +3690,23 @@ def main() -> None:
         .connect_timeout(60)
         .pool_timeout(60)
         .media_write_timeout(600)
+        .post_init(post_init)
         .build()
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("setlevel", setlevel))
+    application.add_handler(CommandHandler("users", users_command))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    # Admin forwards a text post from the backup channel -> bot replies with the channel ID.
+    application.add_handler(
+        MessageHandler(filters.FORWARDED & filters.TEXT & ~filters.COMMAND, report_forwarded_channel_id)
+    )
+    # Must come BEFORE the general button handler: the first matching
+    # handler wins, and access-request buttons have their own format.
+    application.add_handler(CallbackQueryHandler(handle_access_decision, pattern=r"^access:"))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)
 
