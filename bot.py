@@ -5276,46 +5276,83 @@ async def extract_frames_at_interval(
     frames. If total_duration and progress_callback are given, streams
     extraction progress (how much of the video's timeline has been
     scanned) to the callback.
+
+    For the "3 parts" mode (start/length given) the first attempt uses a
+    fast seek before -i. Some files (odd keyframe layout, damaged packets,
+    extra data/subtitle streams) make that attempt fail or produce no
+    frames for a middle section, so if it does we retry with a slower but
+    more tolerant command (seek after -i, video stream only, ignore
+    decode errors) before giving up.
     """
 
     frames_dir = work_dir / "frames"
-    frames_dir.mkdir(exist_ok=True)
-
     pattern = str(frames_dir / "frame_%04d.jpg")
 
-    command = ["ffmpeg", "-y"]
+    def build_command(tolerant: bool) -> list[str]:
+        command = ["ffmpeg", "-y"]
 
-    if progress_callback is not None and total_duration:
-        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+        if progress_callback is not None and total_duration:
+            command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
 
-    if start:
-        # Seek BEFORE -i = fast jump (used by the "3 parts" mode).
-        command += ["-ss", f"{start:.2f}"]
+        if tolerant:
+            command += ["-err_detect", "ignore_err", "-fflags", "+genpts+discardcorrupt"]
 
-    command += [
-        # Limit the decoder's threads (same setting the compression uses) —
-        # without this FFmpeg picks its own count from the host's core count
-        # and holds that many decoded frames in RAM.
-        "-threads", DECODER_THREADS,
-        "-i", input_path,
-    ]
+        if start and not tolerant:
+            # Seek BEFORE -i = fast jump (used by the "3 parts" mode).
+            command += ["-ss", f"{start:.2f}"]
 
-    if length:
-        command += ["-t", f"{length:.2f}"]
+        command += [
+            # Limit the decoder's threads (same setting the compression uses) —
+            # without this FFmpeg picks its own count from the host's core count
+            # and holds that many decoded frames in RAM.
+            "-threads", DECODER_THREADS,
+            "-i", input_path,
+        ]
 
-    command += [
-        "-vf", f"fps=1/{interval}",
-        "-q:v", "3",
-        pattern,
-    ]
+        if start and tolerant:
+            # Seek AFTER -i = decodes up to the start point: slow, but works
+            # on files where the fast jump finds nothing.
+            command += ["-ss", f"{start:.2f}"]
 
-    try:
-        await run_ffmpeg_with_progress(command, total_duration, progress_callback)
-    except RuntimeError:
-        logger.error("PDF frame extraction failed.")
-        return []
+        if length:
+            command += ["-t", f"{length:.2f}"]
 
-    return sorted(frames_dir.glob("frame_*.jpg"))
+        command += [
+            # First video stream only: audio/subtitle/data streams can make
+            # the cut fail on some files.
+            "-map", "0:v:0", "-an", "-sn", "-dn",
+            "-vf", f"fps=1/{interval}",
+            "-q:v", "3",
+            pattern,
+        ]
+        return command
+
+    attempts = [False, True] if start else [False]
+
+    for tolerant in attempts:
+        # Fresh folder for every attempt so a half-finished try can't leak in.
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            await run_ffmpeg_with_progress(build_command(tolerant), total_duration, progress_callback)
+        except RuntimeError:
+            logger.error(
+                "PDF frame extraction failed (start=%s, length=%s, tolerant=%s).",
+                start, length, tolerant,
+            )
+            continue
+
+        frames = sorted(frames_dir.glob("frame_*.jpg"))
+        if frames:
+            return frames
+
+        logger.warning(
+            "PDF frame extraction produced no frames (start=%s, length=%s, tolerant=%s).",
+            start, length, tolerant,
+        )
+
+    return []
 
 
 async def extract_pdf_frames(
@@ -9971,6 +10008,15 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     ):
                         kept_paths[0].unlink(missing_ok=True)
                         kept_paths.pop(0)
+
+                if not kept_paths:
+                    failed_parts += 1
+                    cleanup_work_dir(part_dir)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=MSG_PDF3_PART_FAILED.format(part=part, start=start_text, end=end_text),
+                    )
+                    continue
 
                 previous_signature = await compute_frame_signature(str(kept_paths[-1]))
 
