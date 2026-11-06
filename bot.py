@@ -9,6 +9,7 @@ import tempfile
 import time
 import contextlib
 import contextvars
+import difflib
 import inspect
 import re
 import itertools
@@ -3386,6 +3387,25 @@ DEDUP_MAX_THRESHOLD = 14
 DEDUP_MAX_LOW_GROUP_MEAN = 8
 DEDUP_MIN_GROUP_GAP = 20
 
+# ---- OCR check for the "delete similar frames" step ----
+# Needs the `tesseract` program on the server; without it the step silently
+# works from pixels only. Turn off with DEDUP_OCR=0. For other languages
+# install the language pack and set e.g. OCR_LANGS=eng+ara.
+OCR_ENABLED = os.getenv("DEDUP_OCR", "1") != "0"
+OCR_LANGS = os.getenv("OCR_LANGS", "eng")
+OCR_TIMEOUT = float(os.getenv("OCR_TIMEOUT", "30"))               # seconds per frame
+OCR_TIME_BUDGET = float(os.getenv("OCR_TIME_BUDGET", "900"))      # seconds per dedup run; then pixels only
+OCR_MIN_CHARS = 25          # a frame with at least this many letters/digits "has text"
+OCR_NO_TEXT_CHARS = 10      # fewer than this = "no text" (in between = unsure, no opinion)
+OCR_SAME_RATIO = 0.995      # word-sequence similarity needed to call two texts "the same" (effectively: every word identical)
+OCR_SKIP_PIXEL_DIFF = 2     # pixel diff this low = the very same image, no need to read it
+# Pixels differ MORE than the duplicate threshold, but the words are identical
+# (webcam, cursor, animated background...) -> still a duplicate, as long as the
+# frame has plenty of text and the picture didn't change wildly.
+OCR_MERGE_SAME_TEXT = os.getenv("DEDUP_OCR_MERGE", "1") != "0"
+OCR_MERGE_MIN_CHARS = 60
+OCR_MERGE_MAX_PIXEL_DIFF = int(os.getenv("OCR_MERGE_MAX_PIXEL_DIFF", "60"))   # 0-255, same scale as the pixel threshold
+
 # ============================================================
 # Compression levels
 # ============================================================
@@ -5505,10 +5525,96 @@ def compute_auto_threshold(diffs: list[int]) -> float:
     return min(max(best_split, DEDUP_MIN_THRESHOLD), DEDUP_MAX_THRESHOLD)
 
 
+# ---------------------------------------------------------------------------
+# OCR helpers for the "delete similar frames" step
+# ---------------------------------------------------------------------------
+# The pixel comparison can't tell "same slide" from "same slide with one word
+# changed" when that word is tiny, and it can't tell "same slide" from "same
+# slide + a moving webcam/cursor/animation". Reading the words with Tesseract
+# settles both: if the words changed, the frame is kept; if the words are
+# identical (and there are plenty of them), it's a duplicate.
+# Needs the `tesseract` program on the server (apt install tesseract-ocr, plus
+# e.g. tesseract-ocr-ara for Arabic). Without it everything works as before,
+# using pixels only.
+
+def ocr_normalize(text: str) -> str:
+    """Lowercase words only (letters/digits of any language), single-spaced; 1-char tokens are OCR noise."""
+    return " ".join(token for token in re.findall(r"\w+", (text or "").lower()) if len(token) >= 2)
+
+
+def ocr_char_count(text: str) -> int:
+    return len(text.replace(" ", ""))
+
+
+def ocr_text_ratio(text_a: str, text_b: str) -> float:
+    """0..1 — how much of the two texts' word sequence matches."""
+    words_a, words_b = text_a.split(), text_b.split()
+    if not words_a and not words_b:
+        return 1.0
+    return difflib.SequenceMatcher(None, words_a, words_b, autojunk=False).ratio()
+
+
+def ocr_verdict(text_a: str | None, text_b: str | None) -> bool | None:
+    """
+    True  = the words are the same
+    False = the words changed (different text, or text appeared / disappeared)
+    None  = no opinion (OCR unavailable, or neither frame has meaningful text)
+    """
+    if text_a is None or text_b is None:
+        return None
+
+    len_a, len_b = ocr_char_count(text_a), ocr_char_count(text_b)
+    a_has, b_has = len_a >= OCR_MIN_CHARS, len_b >= OCR_MIN_CHARS
+    a_none, b_none = len_a < OCR_NO_TEXT_CHARS, len_b < OCR_NO_TEXT_CHARS
+
+    if a_has and b_has:
+        return ocr_text_ratio(text_a, text_b) >= OCR_SAME_RATIO
+    if (a_has and b_none) or (b_has and a_none):
+        return False
+    return None
+
+
+async def ocr_frame_text(frame_path: str) -> str | None:
+    """Normalized words found in a frame, or None if OCR isn't available / failed."""
+    if not OCR_ENABLED or not shutil.which("tesseract"):
+        return None
+
+    env = dict(os.environ)
+    env["OMP_THREAD_LIMIT"] = "1"   # keep CPU/RAM small: one thread per tesseract
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "tesseract", str(frame_path), "stdout", "-l", OCR_LANGS, "--psm", "11",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=OCR_TIMEOUT)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+            logger.warning("OCR timed out on %s", frame_path)
+            return None
+    except (OSError, asyncio.CancelledError) as error:
+        if isinstance(error, asyncio.CancelledError):
+            raise
+        logger.warning("OCR could not run: %s", error)
+        return None
+
+    if process.returncode != 0:
+        logger.warning("OCR failed (exit %s) on %s", process.returncode, frame_path)
+        return None
+
+    return ocr_normalize(stdout.decode("utf-8", errors="replace"))
+
+
 async def dedup_frames(
     frame_paths: list[Path],
     threshold: float | None = None,
     progress_callback=None,
+    ocr_merge: bool | None = None,
 ) -> tuple[list[Path], list[Path], float]:
     """
     Walk frames in order, dropping any frame that's extremely similar
@@ -5518,10 +5624,22 @@ async def dedup_frames(
     threshold_used) — the threshold is returned so it can be shown to
     the user for transparency/sanity-checking. If progress_callback is
     given, it's called with 0-100 as frame signatures are computed.
+
+    On top of the pixel comparison, OCR reads the words (when tesseract is
+    installed): a pixel-duplicate whose words changed is KEPT, and a frame
+    whose pixels moved a bit but whose words are identical is DROPPED.
     """
 
     if len(frame_paths) < 2:
         return list(frame_paths), [], threshold if threshold is not None else DEDUP_SIMILARITY_THRESHOLD
+
+    ocr_on = OCR_ENABLED and bool(shutil.which("tesseract"))
+    merge_enabled = OCR_MERGE_SAME_TEXT if ocr_merge is None else ocr_merge
+    if OCR_ENABLED and not ocr_on:
+        logger.warning("tesseract not found — 'delete similar frames' is using pixels only.")
+
+    # With OCR the work has two phases: signatures (0-50%), then the walk (50-100%).
+    scale = 0.5 if ocr_on else 1.0
 
     signature_semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
     completed = 0
@@ -5532,7 +5650,7 @@ async def dedup_frames(
             result = await compute_frame_signature(str(path))
         completed += 1
         if progress_callback is not None:
-            await progress_callback(completed / len(frame_paths) * 100)
+            await progress_callback(completed / len(frame_paths) * 100 * scale)
         return result
 
     signatures = await asyncio.gather(*(bounded_signature(path) for path in frame_paths))
@@ -5548,22 +5666,76 @@ async def dedup_frames(
         ]
         threshold = compute_auto_threshold(adjacent_diffs)
 
+    text_cache: dict[Path, str | None] = {}
+    ocr_started = time.monotonic()
+    ocr_kept = 0     # pixel-duplicates saved because their words changed
+    ocr_merged = 0   # extra duplicates found because their words were identical
+
+    async def text_of(path: Path) -> str | None:
+        nonlocal ocr_on
+        if path in text_cache:
+            return text_cache[path]
+        if not ocr_on:
+            return None
+        if time.monotonic() - ocr_started > OCR_TIME_BUDGET:
+            logger.warning("OCR time budget used up — finishing with pixels only.")
+            ocr_on = False
+            return None
+        text_cache[path] = await ocr_frame_text(str(path))
+        return text_cache[path]
+
     kept: list[Path] = []
     removed: list[Path] = []
     last_kept_signature: bytes | None = None
+    last_kept_path: Path | None = None
 
-    for path, signature in zip(frame_paths, signatures):
-        if (
+    for index, (path, signature) in enumerate(zip(frame_paths, signatures)):
+        is_duplicate = (
             signature is not None
             and last_kept_signature is not None
             and frames_are_near_identical(signature, last_kept_signature, threshold)
-        ):
+        )
+
+        if ocr_on and last_kept_path is not None and signature is not None and last_kept_signature is not None:
+            diff = signature_diff(signature, last_kept_signature)
+
+            if diff is not None:
+                if is_duplicate and diff > OCR_SKIP_PIXEL_DIFF:
+                    # Looks the same — but did any words change?
+                    verdict = ocr_verdict(await text_of(last_kept_path), await text_of(path))
+                    if verdict is False:
+                        is_duplicate = False
+                        ocr_kept += 1
+                elif not is_duplicate and merge_enabled and diff <= OCR_MERGE_MAX_PIXEL_DIFF:
+                    # Pixels moved, but are the words exactly the same?
+                    text_a, text_b = await text_of(last_kept_path), await text_of(path)
+                    if (
+                        text_a is not None
+                        and text_b is not None
+                        and ocr_char_count(text_a) >= OCR_MERGE_MIN_CHARS
+                        and ocr_char_count(text_b) >= OCR_MERGE_MIN_CHARS
+                        and ocr_verdict(text_a, text_b) is True
+                    ):
+                        is_duplicate = True
+                        ocr_merged += 1
+
+        if progress_callback is not None and ocr_on:
+            await progress_callback(50 + (index + 1) / len(frame_paths) * 50)
+
+        if is_duplicate:
             removed.append(path)
             continue
 
         kept.append(path)
         if signature is not None:
             last_kept_signature = signature
+            last_kept_path = path
+
+    if ocr_kept or ocr_merged:
+        logger.info(
+            "OCR check: kept %s frame(s) whose words changed, dropped %s extra frame(s) with identical words.",
+            ocr_kept, ocr_merged,
+        )
 
     return kept, removed, threshold
 
@@ -8292,6 +8464,19 @@ PDF_COMPRESS_LEVELS: dict[str, tuple[str, str, str]] = {
     "strong": ("🔴 Strong", "/screen", "smallest file, images get soft"),
 }
 
+# ---- "Delete duplicate pages" ----
+# Pages are rendered to small pictures (ghostscript), compared the same way as the
+# video frames (pixels + OCR words), and the PDF is rebuilt with only the kept pages
+# (qpdf — lossless: text, links and quality are untouched).
+PDF_DEDUP_MAX_PAGES = int(os.getenv("PDF_DEDUP_MAX_PAGES", "500"))
+PDF_DEDUP_DPI = int(os.getenv("PDF_DEDUP_DPI", "150"))
+# The bottom strip of every page is ignored when comparing, so a changing page
+# number / footer doesn't make two identical pages look different. 0 = compare everything.
+PDF_DEDUP_IGNORE_FOOTER_PERCENT = float(os.getenv("PDF_DEDUP_IGNORE_FOOTER_PERCENT", "6"))
+PDFX_NEED_DEDUP_TOOLS = "Deleting duplicates isn't set up on this server yet (ghostscript and qpdf are both needed)."
+PDFX_DEDUP_NONE = "ℹ️ {name}: no duplicate pages found — nothing was changed. It's still in your list."
+PDFX_DEDUP_NO_OCR_NOTE = "\n⚠️ Text reading (OCR) isn't installed on this server, so pages were compared by how they look only."
+
 PDFX_EXPIRED = "⚠️ That PDF list isn't active anymore — please send the PDF(s) again."
 PDFX_BUSY = "⏳ I'm still working on your PDFs — one moment."
 PDFX_NOT_YOURS = "⛔ That list belongs to someone else."
@@ -8433,6 +8618,7 @@ def pdf_screen(session: dict) -> tuple[str, InlineKeyboardMarkup]:
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Merge files", callback_data=f"pdfx:merge:{sid}")],
         [InlineKeyboardButton("🗜 Compress", callback_data=f"pdfx:compress:{sid}")],
+        [InlineKeyboardButton("🧹 Delete duplicate pages", callback_data=f"pdfx:dedup:{sid}")],
         [InlineKeyboardButton("✏️ Change name / thumbnail", callback_data=f"pdfx:name:{sid}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"pdfx:cancel:{sid}")],
     ])
@@ -8574,6 +8760,107 @@ def pdf_output_name(session: dict, entry: dict | None, suffix: str, index: int, 
     return (sanitize_filename(base) or "file") + ".pdf"
 
 
+def pdf_page_ranges(numbers: list[int]) -> str:
+    """[1, 2, 3, 5, 8, 9] -> '1-3,5,8-9' (the page syntax qpdf understands)."""
+    ranges: list[str] = []
+    start = previous = numbers[0]
+
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(f"{start}-{previous}" if previous > start else str(start))
+        start = previous = number
+
+    ranges.append(f"{start}-{previous}" if previous > start else str(start))
+    return ",".join(ranges)
+
+
+async def dedup_pdf_pages(
+    source: Path,
+    output: Path,
+    work_dir: Path,
+    progress_callback=None,
+) -> tuple[int, int]:
+    """
+    Remove pages that repeat the previous kept page (same look AND same words).
+    Writes `output` only when something was removed. Returns (total_pages, removed_pages).
+    Raises RuntimeError with a short, user-readable reason.
+    """
+    pages_dir = work_dir / "pages"
+    compare_dir = work_dir / "compare"
+
+    try:
+        for folder in (pages_dir, compare_dir):
+            shutil.rmtree(folder, ignore_errors=True)
+        pages_dir.mkdir(parents=True)
+
+        returncode, stderr = await run_tool(
+            [
+                "gs", "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER",
+                "-sDEVICE=jpeg", "-dJPEGQ=85", f"-r{PDF_DEDUP_DPI}",
+                "-dTextAlphaBits=4", "-dGraphicsAlphaBits=4",
+                f"-dLastPage={PDF_DEDUP_MAX_PAGES + 1}",
+                f"-sOutputFile={pages_dir}/page_%04d.jpg", str(source),
+            ],
+            PDF_JOB_TIMEOUT,
+        )
+        pages = sorted(pages_dir.glob("page_*.jpg"))
+
+        if returncode != 0 or not pages:
+            raise RuntimeError(f"couldn't read the pages ({pdf_short_error(stderr)})")
+
+        if len(pages) > PDF_DEDUP_MAX_PAGES:
+            raise RuntimeError(f"it has more than {PDF_DEDUP_MAX_PAGES} pages, which is too many to compare")
+
+        total = len(pages)
+        if total < 2:
+            return total, 0
+
+        # Compare everything except the footer strip (page numbers change on every page).
+        compare_paths = pages
+        if PDF_DEDUP_IGNORE_FOOTER_PERCENT > 0:
+            keep = max(0.5, 1 - PDF_DEDUP_IGNORE_FOOTER_PERCENT / 100)
+            compare_dir.mkdir(parents=True)
+            returncode, _stderr = await run_tool(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-start_number", "1", "-i", f"{pages_dir}/page_%04d.jpg",
+                    "-vf", f"crop=iw:trunc(ih*{keep:.3f}/2)*2:0:0",
+                    "-q:v", "3", "-start_number", "1", f"{compare_dir}/page_%04d.jpg",
+                ],
+                PDF_JOB_TIMEOUT,
+            )
+            cropped = sorted(compare_dir.glob("page_*.jpg"))
+            if returncode == 0 and len(cropped) == total:
+                compare_paths = cropped
+
+        # ocr_merge=False: in a document, "same words but the picture changed" is a
+        # different page (a new diagram under the same caption), so only exact
+        # look-alikes are ever removed.
+        kept, removed, _threshold = await dedup_frames(
+            compare_paths, progress_callback=progress_callback, ocr_merge=False
+        )
+
+        if not removed:
+            return total, 0
+
+        numbers = sorted(int(path.stem.split("_")[1]) for path in kept)
+        returncode, stderr = await run_tool(
+            ["qpdf", str(source), "--pages", ".", pdf_page_ranges(numbers), "--", str(output)],
+            PDF_JOB_TIMEOUT,
+        )
+
+        # qpdf exits with 3 when it finished but had warnings: the output is fine.
+        if returncode not in (0, 3) or not output.exists():
+            raise RuntimeError(f"couldn't rebuild the PDF ({pdf_short_error(stderr)})")
+
+        return total, len(removed)
+    finally:
+        for folder in (pages_dir, compare_dir):
+            shutil.rmtree(folder, ignore_errors=True)
+
+
 async def pdf_download(context, entry: dict, path: Path) -> None:
     telegram_file = await with_retries(context.bot.get_file, entry["file_id"])
     await with_retries(telegram_file.download_to_drive, custom_path=str(path))
@@ -8599,12 +8886,13 @@ async def run_pdf_job(
     action: str,
     level: str | None = None,
 ) -> None:
-    """action: 'merge' | 'compress' | 'send'. Runs in the shared work slot, one file at a time."""
+    """action: 'merge' | 'compress' | 'dedup' | 'send'. Runs in the shared work slot, one file at a time."""
     bot = context.bot
     owner_id = session["user_id"]
     session["running"] = True
     slot_held = False
     failed: list[dict] = []
+    unchanged: list[dict] = []   # (dedup) nothing to remove: stays in the list, keeps its charge
     succeeded: list[dict] = []
     problem = ""
 
@@ -8657,6 +8945,9 @@ async def run_pdf_job(
             if action == "compress" and not shutil.which("gs"):
                 raise RuntimeError(PDFX_NEED_GS)
 
+            if action == "dedup" and not (shutil.which("gs") and shutil.which("qpdf")):
+                raise RuntimeError(PDFX_NEED_DEDUP_TOOLS)
+
             for number, entry in enumerate(files, 1):
                 source = work_dir / f"in_{number}.pdf"
                 output = work_dir / f"out_{number}.pdf"
@@ -8666,7 +8957,46 @@ async def run_pdf_job(
                     await pdf_download(context, entry, source)
                     original_size = source.stat().st_size
 
-                    if action == "compress":
+                    if action == "dedup":
+                        last_update = {"time": 0.0, "percent": -10.0}
+                        scan_label = f"🧹 Comparing the pages of {number}/{total}…"
+
+                        async def page_progress(percent: float) -> None:
+                            now = time.monotonic()
+                            if (
+                                percent - last_update["percent"] < 4
+                                and now - last_update["time"] < 3
+                                and percent < 100
+                            ):
+                                return
+                            last_update["time"], last_update["percent"] = now, percent
+                            with contextlib.suppress(Exception):
+                                await status(f"{scan_label}\n{render_progress_bar(percent)}")
+
+                        await status(f"📖 Reading the pages of {number}/{total}…")
+                        page_count, removed_count = await dedup_pdf_pages(
+                            source, output, work_dir, progress_callback=page_progress
+                        )
+
+                        if removed_count == 0:
+                            unchanged.append(entry)
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=PDFX_DEDUP_NONE.format(name=entry["name"]),
+                            )
+                            continue
+
+                        new_size = output.stat().st_size
+                        caption = (
+                            f"🧹 Removed {removed_count} duplicate page{'s' if removed_count != 1 else ''} — "
+                            f"{page_count - removed_count} of {page_count} pages left · "
+                            f"{format_size(original_size)} → {format_size(new_size)}"
+                        )
+                        if not (OCR_ENABLED and shutil.which("tesseract")):
+                            caption += PDFX_DEDUP_NO_OCR_NOTE
+                        send_path = output
+                        filename = pdf_output_name(session, entry, " (no duplicates)", number, total)
+                    elif action == "compress":
                         label, preset, _detail = PDF_COMPRESS_LEVELS[level]
                         await status(f"🗜 Compressing {number}/{total} ({label.split(' ', 1)[1]})… this can take a minute")
                         returncode, stderr = await run_tool(
@@ -8722,6 +9052,7 @@ async def run_pdf_job(
     except Exception as error:
         logger.exception("PDF job failed")
         failed = list(session["files"])
+        unchanged = []
         succeeded = []
         problem = str(error)
         with contextlib.suppress(Exception):
@@ -8731,10 +9062,10 @@ async def run_pdf_job(
         if slot_held:
             release_work_slot()
 
-    if failed:
-        # Keep only the files that didn't work so they can try again; give back what was
-        # charged for the ones that failed.
-        session["files"] = failed
+    if failed or unchanged:
+        # Keep only the files that didn't work (or had nothing to remove) so they can try
+        # again; give back what was charged for the ones that failed.
+        session["files"] = failed + unchanged
         refund = sum(int(f.get("charged") or 0) for f in failed)
         if refund > 0 and quota_applies(owner_id):
             quota_refund(owner_id, refund)
@@ -8814,6 +9145,8 @@ async def handle_pdf_callback(query, context: ContextTypes.DEFAULT_TYPE, user_id
         await pdf_render(bot, chat_id, session, "name")
     elif command == "gomerge":
         await run_pdf_job(context, chat_id, session, "merge")
+    elif command == "dedup":
+        await run_pdf_job(context, chat_id, session, "dedup")
     elif command == "sendnow":
         await run_pdf_job(context, chat_id, session, "send")
     elif command.startswith("c_") and command[2:] in PDF_COMPRESS_LEVELS:
@@ -9949,6 +10282,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         # 33% / 33% / 34% of the timeline.
         boundaries = [0.0, duration * 0.33, duration * 0.66, duration]
         previous_signature: bytes | None = None   # last kept frame of the previous part
+        previous_text: str | None = None          # its words (OCR), if tesseract is installed
         total_kept = 0
         failed_parts = 0
 
@@ -10001,11 +10335,15 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 # part's last kept frame.
                 if previous_signature is not None and kept_paths:
                     first_signature = await compute_frame_signature(str(kept_paths[0]))
-                    if (
+                    same_as_previous = (
                         first_signature is not None
                         and frames_are_near_identical(first_signature, previous_signature, threshold_used)
-                        and len(kept_paths) > 1
-                    ):
+                    )
+                    if same_as_previous and previous_text is not None:
+                        # Looks the same — but did the words change across the cut?
+                        if ocr_verdict(previous_text, await ocr_frame_text(str(kept_paths[0]))) is False:
+                            same_as_previous = False
+                    if same_as_previous and len(kept_paths) > 1:
                         kept_paths[0].unlink(missing_ok=True)
                         kept_paths.pop(0)
 
@@ -10019,6 +10357,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     continue
 
                 previous_signature = await compute_frame_signature(str(kept_paths[-1]))
+                previous_text = await ocr_frame_text(str(kept_paths[-1]))
 
                 await status_message.edit_text(MSG_PDF3_BUILDING_PART.format(part=part))
 
