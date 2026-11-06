@@ -8948,12 +8948,19 @@ def is_rar_document(document) -> bool:
     return name.endswith(".rar") or mime in ("application/vnd.rar", "application/x-rar-compressed", "application/x-rar")
 
 
-def find_rar_tool() -> str | None:
-    for candidate in ("unrar", "7zz", "7z"):
+def find_rar_tools() -> list[str]:
+    """Every installed program that can open a RAR, best first (they are tried in this order)."""
+    tools = []
+    for candidate in ("unrar", "7zz", "7z", "bsdtar"):
         found = shutil.which(candidate)
         if found:
-            return found
-    return None
+            tools.append(found)
+    return tools
+
+
+def find_rar_tool() -> str | None:
+    tools = find_rar_tools()
+    return tools[0] if tools else None
 
 
 def directory_size(path: Path) -> int:
@@ -8996,32 +9003,30 @@ def rar_short_error(stderr: str) -> str:
         return "it's password-protected (or the password was wrong) — send it again with the password as the caption"
     if "volume" in lowered or "next part" in lowered:
         return "it looks like a multi-part archive, which I can't open"
-    if "not rar archive" in lowered or "not a rar" in lowered or "is not rar" in lowered or "cannot open" in lowered:
-        return "that doesn't look like a valid RAR file"
 
     lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
     return lines[-1][:200] if lines else "unknown error"
 
 
-async def extract_rar(archive: Path, dest: Path, password: str | None) -> None:
-    """Unpack archive into dest. Raises RuntimeError with a plain-language reason."""
-    tool = find_rar_tool()
-    if tool is None:
-        raise RuntimeError(RARX_NEED_TOOL)
+def rar_command(tool: str, archive: Path, dest: Path, password: str | None) -> list[str]:
+    name = Path(tool).name
 
-    # Never let a huge archive (a "zip bomb") fill the disk: stop it at the limit.
-    free = shutil.disk_usage(dest).free
-    limit = min(RAR_MAX_EXTRACT_MB * 1024 * 1024, free - 200 * 1024 * 1024)
-    if limit <= 0:
-        raise RuntimeError(RARX_NO_ROOM)
+    if name == "unrar":
+        return [tool, "x", "-y", "-idq", "-o+", f"-p{password}" if password else "-p-", str(archive), str(dest) + "/"]
 
-    if Path(tool).name == "unrar":
-        command = [tool, "x", "-y", "-idq", "-o+", f"-p{password}" if password else "-p-", str(archive), str(dest) + "/"]
-    else:
-        command = [tool, "x", "-y", "-bd", f"-o{dest}"]
-        if password:
-            command.append(f"-p{password}")
-        command.append(str(archive))
+    if name == "bsdtar":
+        return [tool, "-xf", str(archive), "-C", str(dest)]
+
+    command = [tool, "x", "-y", "-bd", f"-o{dest}"]
+    if password:
+        command.append(f"-p{password}")
+    command.append(str(archive))
+    return command
+
+
+async def run_rar_tool(tool: str, archive: Path, dest: Path, password: str | None, limit: int) -> tuple[int, str, bool]:
+    """Run one unpacking program. Returns (exit code, its error text, whether it hit the size limit)."""
+    command = rar_command(tool, archive, dest, password)
 
     if FFMPEG_NICE > 0 and shutil.which("nice"):
         command = ["nice", "-n", str(FFMPEG_NICE), *command]
@@ -9029,7 +9034,7 @@ async def extract_rar(archive: Path, dest: Path, password: str | None) -> None:
     process = await asyncio.create_subprocess_exec(
         *command,
         stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
@@ -9048,7 +9053,7 @@ async def extract_rar(archive: Path, dest: Path, password: str | None) -> None:
     watcher = asyncio.create_task(watch_size())
 
     try:
-        _stdout, stderr = await asyncio.wait_for(process.communicate(), RAR_EXTRACT_TIMEOUT)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), RAR_EXTRACT_TIMEOUT)
     except asyncio.TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             process.kill()
@@ -9059,12 +9064,65 @@ async def extract_rar(archive: Path, dest: Path, password: str | None) -> None:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await watcher
 
-    if exceeded:
-        raise RuntimeError(RARX_TOO_BIG.format(mb=int(limit / 1024 / 1024)))
+    # Some programs (7z) print their errors on stdout, so keep both.
+    text = (stderr.decode(errors="replace") + "\n" + stdout.decode(errors="replace")).strip()
+    return process.returncode, text, exceeded
 
-    # 0 = fine, 1 = finished with a minor warning (the files are still good).
-    if process.returncode not in (0, 1):
-        raise RuntimeError(rar_short_error(stderr.decode(errors="replace")))
+
+async def extract_rar(archive: Path, dest: Path, password: str | None) -> None:
+    """
+    Unpack archive into dest. Tries every installed unpacking program until one works
+    (some builds of 7-Zip leave RAR support out). Raises RuntimeError with a plain-language reason.
+    """
+    tools = find_rar_tools()
+    if not tools:
+        raise RuntimeError(RARX_NEED_TOOL)
+
+    # Never let a huge archive (a "zip bomb") fill the disk: stop it at the limit.
+    free = shutil.disk_usage(dest).free
+    limit = min(RAR_MAX_EXTRACT_MB * 1024 * 1024, free - 200 * 1024 * 1024)
+    if limit <= 0:
+        raise RuntimeError(RARX_NO_ROOM)
+
+    with open(archive, "rb") as handle:
+        header = handle.read(8)
+
+    has_signature = header.startswith(b"Rar!\x1a\x07")
+    logger.info("RAR header bytes: %r (tools available: %s)", header, ", ".join(Path(t).name for t in tools))
+
+    tried: list[str] = []
+    first_problem = ""
+
+    for tool in tools:
+        tool_name = Path(tool).name
+
+        # Start every attempt from an empty folder (a failed attempt may have left pieces).
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir()
+
+        returncode, output, exceeded = await run_rar_tool(tool, archive, dest, password, limit)
+
+        if exceeded:
+            raise RuntimeError(RARX_TOO_BIG.format(mb=int(limit / 1024 / 1024)))
+
+        # 0 = fine; for unrar / 7-Zip, 1 = finished with a minor warning (files are still good).
+        ok_codes = (0,) if tool_name == "bsdtar" else (0, 1)
+
+        if returncode in ok_codes:
+            return
+
+        logger.error("%s could not unpack the RAR (exit code %s):\n%s", tool_name, returncode, output)
+        tried.append(tool_name)
+
+        lowered = output.lower()
+        if "password" in lowered or "encrypted" in lowered:
+            raise RuntimeError(rar_short_error(output))
+
+        if not first_problem:
+            first_problem = rar_short_error(output)
+
+    hint = "" if has_signature else " (the file doesn't start like a RAR archive — was it renamed or cut short?)"
+    raise RuntimeError(f"none of my unpacking tools ({', '.join(tried)}) could open it: {first_problem}{hint}")
 
 
 async def handle_rar_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE, document) -> None:
