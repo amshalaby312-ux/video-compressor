@@ -568,6 +568,17 @@ BTN_CANCEL = "❌ Cancel"
 # ---- pdf interval keyboard ----
 BTN_S = "{seconds}s"
 BTN_AUTO_DETECT_CHANGES = "🧠 Auto-detect changes"
+BTN_PDF_IN_THREE_PARTS = "🧩 Do it in 3 parts (saves space)"
+MSG_PDF3_SCANNING_PART = "🧩 Part {part}/3 — scanning (sampling every {interval:.1f}s)..."
+MSG_PDF3_COMPARING_PART = "🧩 Part {part}/3 — sampled {count} frame(s), comparing for real changes..."
+MSG_PDF3_BUILDING_PART = "🧩 Part {part}/3 — building the PDF..."
+MSG_PDF3_PART_CAPTION = (
+    "📄 Part {part}/3 ({start} → {end}): {kept} frame(s) kept out of {sampled} sampled "
+    "(every {interval:.1f}s).\n(auto threshold: {threshold:.0f})"
+)
+MSG_PDF3_PART_FAILED = "⚠️ Part {part}/3 ({start} → {end}) couldn't be extracted — moving on to the next part."
+MSG_PDF3_NEEDS_DURATION = "⚠️ I couldn't read this video's length, so I can't split it into 3 parts. Try one of the other options."
+MSG_PDF3_DONE = "✅ All parts done. Part PDFs were removed from the server after each one was sent."
 
 # ---- smart analyze ----
 MSG_RESOLUTION = "Resolution {width}×{height} → {out_w}×{out_h}"
@@ -697,7 +708,7 @@ MSG_SOMETHING_WENT_WRONG_WHILE_ANALYZING = (
 MSG_I_M_WAITING_FOR_TEXT = "✏️ I'm waiting for text here, not an image."
 
 # ---- handle document ----
-MSG_THAT_DOESN_T_LOOK_LIKE = "❌ That doesn't look like a video or audio file."
+MSG_THAT_DOESN_T_LOOK_LIKE = "❌ That doesn't look like a video, audio, PDF or RAR file."
 
 # ---- update command ----
 MSG_UPDATE_MODE_IS_OFF_NEW = "✅ Update mode is OFF — new files are accepted again."
@@ -3964,6 +3975,7 @@ async def idle_cleanup_loop(bot) -> None:
         try:
             removed = await expire_idle_files(bot)
             removed += await expire_idle_merge_sessions(bot)
+            removed += await expire_idle_pdf_sessions(bot)
             if removed:
                 logger.info("Deleted %d idle stored video(s).", removed)
         except asyncio.CancelledError:
@@ -4356,6 +4368,7 @@ def pdf_interval_keyboard(message_id: int) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(BTN_AUTO_DETECT_CHANGES, callback_data=f"pdfauto:_:{message_id}")],
+        [InlineKeyboardButton(BTN_PDF_IN_THREE_PARTS, callback_data=f"pdf3:_:{message_id}")],
         row,
         [InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")],
     ])
@@ -5253,6 +5266,8 @@ async def extract_frames_at_interval(
     interval: float,
     total_duration: float | None = None,
     progress_callback=None,
+    start: float | None = None,
+    length: float | None = None,
 ) -> list[Path]:
     """
     Grab one frame every `interval` seconds. Returns the sorted list
@@ -5273,12 +5288,22 @@ async def extract_frames_at_interval(
     if progress_callback is not None and total_duration:
         command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
 
+    if start:
+        # Seek BEFORE -i = fast jump (used by the "3 parts" mode).
+        command += ["-ss", f"{start:.2f}"]
+
     command += [
         # Limit the decoder's threads (same setting the compression uses) —
         # without this FFmpeg picks its own count from the host's core count
         # and holds that many decoded frames in RAM.
         "-threads", DECODER_THREADS,
         "-i", input_path,
+    ]
+
+    if length:
+        command += ["-t", f"{length:.2f}"]
+
+    command += [
         "-vf", f"fps=1/{interval}",
         "-q:v", "3",
         pattern,
@@ -8135,6 +8160,10 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 await delete_pdf_slides(update, context, session_mid, numbers)
         return
 
+    if waiting["field"] in ("pdfname", "pdfthumb"):
+        await handle_pdf_text(update, context, waiting)
+        return
+
     pending = pending_compressions.get(waiting["mid"])
 
     if pending is None:
@@ -8191,11 +8220,1014 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if waiting is None:
         return
 
+    if waiting["field"] == "pdfthumb":
+        await apply_pdf_thumbnail(update, context, message.photo[-1].file_id)
+        return
+
     if waiting["field"] not in ("cover", "videocover"):
         await message.reply_text(MSG_I_M_WAITING_FOR_TEXT)
         return
 
     await apply_cover_image(update, context, message.photo[-1].file_id)
+
+
+# ============================================================
+# PDF files: merge / compress / rename + thumbnail
+# ============================================================
+#
+# Send the bot a PDF and it shows a small menu. Every PDF the chat sends while
+# that menu is open is added to the same list (kept in the order it was sent).
+# Nothing is downloaded until a button that needs the files is tapped, so an
+# open menu costs no disk space.
+#
+# Needs two programs inside the container (see the Dockerfile line):
+#   qpdf        -> merging (fast, lossless, very light on RAM)
+#   ghostscript -> compressing (the program is called "gs")
+
+PDF_IDLE_MINUTES = int(os.getenv("PDF_IDLE_MINUTES", "15"))
+PDF_JOB_TIMEOUT = int(os.getenv("PDF_JOB_TIMEOUT", "900"))   # seconds per merge / per compressed file
+PDF_MAX_LISTED = 15
+
+# key -> (button label, ghostscript preset, short description)
+PDF_COMPRESS_LEVELS: dict[str, tuple[str, str, str]] = {
+    "light": ("🟢 Light", "/printer", "best quality, a little smaller"),
+    "balanced": ("🟡 Balanced", "/ebook", "good quality, much smaller"),
+    "strong": ("🔴 Strong", "/screen", "smallest file, images get soft"),
+}
+
+PDFX_EXPIRED = "⚠️ That PDF list isn't active anymore — please send the PDF(s) again."
+PDFX_BUSY = "⏳ I'm still working on your PDFs — one moment."
+PDFX_NOT_YOURS = "⛔ That list belongs to someone else."
+PDFX_NEED_TWO = "Send at least one more PDF first — every PDF you send gets added to the list, in order."
+PDFX_NEED_QPDF = "Merging isn't set up on this server yet (qpdf is missing)."
+PDFX_NEED_GS = "Compressing isn't set up on this server yet (ghostscript is missing)."
+PDFX_CANCELLED = "❌ Cancelled — the list was cleared."
+PDFX_CANCELLED_REFUNDED = "❌ Cancelled — the list was cleared and {size} was given back to your daily limit."
+PDFX_IDLE = "🧹 I cleared your PDF list because nothing happened for {minutes} minutes."
+PDFX_IDLE_REFUNDED = "🧹 I cleared your PDF list after {minutes} minutes of nothing happening, and gave {size} back to your daily limit."
+PDFX_ASK_NAME = "✏️ Send me the new file name (just the name, no .pdf needed).\nSend - to go back to the original name."
+PDFX_ASK_THUMB = "🖼 Send me the picture to use as the file's thumbnail (as a photo or as an image file)."
+PDFX_NAME_HAS_NO_USABLE = "⚠️ That name has no usable characters — please send a different one."
+PDFX_SEND_AN_IMAGE = "I'm waiting for an image — send a photo, or tap Back."
+PDFX_THUMB_FAILED = "⚠️ I couldn't read that image. Please send a normal JPG/PNG picture."
+
+pdf_file_sessions: dict[int, dict] = {}   # chat_id -> the open PDF list
+
+
+def is_pdf_document(document) -> bool:
+    mime = (document.mime_type or "").lower()
+    name = (document.file_name or "").lower()
+    return mime == "application/pdf" or name.endswith(".pdf")
+
+
+def pdf_session_dir(session: dict) -> Path:
+    """The folder this list's files live in (created the first time it's needed)."""
+    folder = session.get("dir")
+    if folder is None or not Path(folder).is_dir():
+        Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix=f"pdf_{session['sid']}_", dir=TEMP_DIR))
+        session["dir"] = folder
+    return Path(folder)
+
+
+def pdf_forget_session(chat_id: int, session: dict) -> None:
+    """Delete everything this list stored and drop it (nothing else is touched)."""
+    if session.get("dir"):
+        cleanup_work_dir(Path(session["dir"]))
+
+    if pdf_file_sessions.get(chat_id) is session:
+        pdf_file_sessions.pop(chat_id, None)
+
+    waiting = awaiting_input.get(chat_id)
+    if waiting and waiting.get("field") in ("pdfname", "pdfthumb") and waiting.get("mid") == session["sid"]:
+        awaiting_input.pop(chat_id, None)
+
+
+def pdf_refund_all(session: dict) -> str:
+    """Give back the daily-limit bytes charged for the files still in the list."""
+    total = sum(int(f.get("charged") or 0) for f in session["files"])
+    if total > 0 and quota_applies(session["user_id"]):
+        quota_refund(session["user_id"], total)
+        return format_size(total)
+    return ""
+
+
+def pdf_list_text(session: dict) -> str:
+    files = sorted(session["files"], key=lambda f: f["mid"])
+    lines = []
+
+    for number, entry in enumerate(files[:PDF_MAX_LISTED], 1):
+        lines.append(f"{number}. {entry['name']} — {format_size(entry['size'])}")
+
+    if len(files) > PDF_MAX_LISTED:
+        lines.append(f"… and {len(files) - PDF_MAX_LISTED} more")
+
+    total = sum(int(entry["size"] or 0) for entry in files)
+    lines.append(f"Total: {format_size(total)}")
+    return "\n".join(lines)
+
+
+def pdf_meta_text(session: dict) -> str:
+    name = session.get("out_name")
+    thumb = session.get("thumb_path")
+    return (
+        f"Name: {name + '.pdf' if name else '— (keeps the original)'}\n"
+        f"Thumbnail: {'✅ set' if thumb else '—'}"
+    )
+
+
+def pdf_screen(session: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """The text + buttons for whichever screen this list is currently on."""
+    sid = session["sid"]
+    mode = session.get("mode", "menu")
+    count = len(session["files"])
+    plural = "file" if count == 1 else "files"
+
+    if mode == "merge":
+        text = (
+            f"🔗 Merge mode — send the other PDFs now.\n"
+            f"They are merged in the order you sent them.\n\n"
+            f"{pdf_list_text(session)}"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Start merging ({count} {plural})", callback_data=f"pdfx:gomerge:{sid}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:menu:{sid}")],
+        ])
+        return text, keyboard
+
+    if mode == "compress":
+        lines = [f"🗜 How strongly should I compress {'it' if count == 1 else 'each of them'}?", ""]
+        for label, _preset, detail in PDF_COMPRESS_LEVELS.values():
+            lines.append(f"{label} — {detail}")
+        text = "\n".join(lines) + "\n\n" + pdf_list_text(session)
+        rows = [
+            [InlineKeyboardButton(label, callback_data=f"pdfx:c_{key}:{sid}")]
+            for key, (label, _preset, _detail) in PDF_COMPRESS_LEVELS.items()
+        ]
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:menu:{sid}")])
+        return text, InlineKeyboardMarkup(rows)
+
+    if mode == "name":
+        text = (
+            "✏️ Name & thumbnail — used for the file I send back "
+            "(merged, compressed, or sent as is).\n\n"
+            f"{pdf_meta_text(session)}"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Set name", callback_data=f"pdfx:setname:{sid}")],
+            [InlineKeyboardButton("🖼 Set thumbnail", callback_data=f"pdfx:setthumb:{sid}")],
+            [InlineKeyboardButton("🧹 Clear name & thumbnail", callback_data=f"pdfx:clearmeta:{sid}")],
+            [InlineKeyboardButton("📤 Send now (no compression)", callback_data=f"pdfx:sendnow:{sid}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:menu:{sid}")],
+        ])
+        return text, keyboard
+
+    if mode in ("askname", "askthumb"):
+        text = PDFX_ASK_NAME if mode == "askname" else PDFX_ASK_THUMB
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:name:{sid}")],
+        ])
+        return text, keyboard
+
+    text = (
+        f"📄 {count} PDF {plural}\n\n{pdf_list_text(session)}\n\n"
+        "Send more PDFs to add them — they stay in the order you sent them."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Merge files", callback_data=f"pdfx:merge:{sid}")],
+        [InlineKeyboardButton("🗜 Compress", callback_data=f"pdfx:compress:{sid}")],
+        [InlineKeyboardButton("✏️ Change name / thumbnail", callback_data=f"pdfx:name:{sid}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"pdfx:cancel:{sid}")],
+    ])
+    return text, keyboard
+
+
+async def pdf_edit(bot, chat_id: int, session: dict, text: str, keyboard=None) -> None:
+    """Show text on this list's one menu message (edit it, or send it the first time)."""
+    async with session["lock"]:
+        menu_mid = session.get("menu_mid")
+
+        if menu_mid is not None:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=menu_mid, text=text, reply_markup=keyboard
+                )
+                return
+            except Exception as error:
+                if "not modified" in str(error).lower():
+                    return
+                # The message is gone or can't be edited: fall through and send a fresh one.
+
+        sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+        session["menu_mid"] = sent.message_id
+
+
+async def pdf_render(bot, chat_id: int, session: dict, mode: str | None = None) -> None:
+    if mode:
+        session["mode"] = mode
+
+    text, keyboard = pdf_screen(session)
+    await pdf_edit(bot, chat_id, session, text, keyboard)
+
+
+async def handle_pdf_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE, document) -> None:
+    """A PDF arrived: add it to this chat's list (starting one if needed) and show the menu."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if chat_id in merge_sessions:
+        await message.reply_text(MSG_MERGE_VIDEOS_ONLY)
+        return
+
+    if update_mode["on"] and not is_admin(user_id):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    session = pdf_file_sessions.get(chat_id)
+
+    if session is not None and session.get("running"):
+        await message.reply_text(PDFX_BUSY)
+        return
+
+    size = int(document.file_size or 0)
+
+    if file_too_large(user_id, size):
+        await message.reply_text(file_too_large_text(user_id, size))
+        return
+
+    if not quota_allows(user_id, size):
+        await message.reply_text(quota_refusal_text(user_id, size))
+        return
+
+    quota_consume(user_id, size)
+
+    # (No await between the lookup above and the append below, so two PDFs that
+    # arrive together can't start two separate lists.)
+    session = pdf_file_sessions.get(chat_id)
+    if session is None:
+        session = {
+            "sid": message.message_id,
+            "user_id": user_id,
+            "files": [],
+            "mode": "menu",
+            "menu_mid": None,
+            "lock": asyncio.Lock(),
+            "last_active": time.time(),
+        }
+        pdf_file_sessions[chat_id] = session
+
+    session["files"].append({
+        "file_id": document.file_id,
+        "name": document.file_name or f"file_{message.message_id}.pdf",
+        "size": size,
+        "charged": size,
+        "mid": message.message_id,
+    })
+    session["last_active"] = time.time()
+
+    if session.get("mode") in ("askname", "askthumb"):
+        session["mode"] = "menu"
+        awaiting_input.pop(chat_id, None)
+
+    await pdf_render(context.bot, chat_id, session)
+
+
+async def run_tool(command: list[str], timeout: float) -> tuple[int, str]:
+    """Run an external program (low priority, with a time limit). Returns (exit code, stderr)."""
+    if FFMPEG_NICE > 0 and shutil.which("nice"):
+        command = ["nice", "-n", str(FFMPEG_NICE), *command]
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        _stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.wait()
+        raise RuntimeError("it took too long and was stopped")
+
+    return process.returncode, stderr.decode(errors="replace")
+
+
+def pdf_short_error(stderr: str) -> str:
+    lowered = stderr.lower()
+    if "password" in lowered or "encrypt" in lowered:
+        return "the PDF is password-protected"
+    lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+    return (lines[-1][:200] if lines else "unknown error")
+
+
+def pdf_output_name(session: dict, entry: dict | None, suffix: str, index: int, total: int) -> str:
+    """The file name to send: the chosen name (numbered if several), else the original."""
+    chosen = session.get("out_name")
+
+    if chosen:
+        base = f"{chosen} {index}" if total > 1 else chosen
+    elif entry is not None:
+        base = Path(entry["name"]).stem + suffix
+    else:
+        base = "merged"
+
+    return (sanitize_filename(base) or "file") + ".pdf"
+
+
+async def pdf_download(context, entry: dict, path: Path) -> None:
+    telegram_file = await with_retries(context.bot.get_file, entry["file_id"])
+    await with_retries(telegram_file.download_to_drive, custom_path=str(path))
+    delete_server_copy(telegram_file)
+
+
+async def pdf_send(context, chat_id: int, session: dict, path: Path, filename: str, caption: str) -> None:
+    thumb = session.get("thumb_path")
+    await with_retries(
+        context.bot.send_document,
+        chat_id=chat_id,
+        document=str(path),
+        filename=filename,
+        caption=caption,
+        thumbnail=str(thumb) if thumb and Path(thumb).exists() else None,
+    )
+
+
+async def run_pdf_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    session: dict,
+    action: str,
+    level: str | None = None,
+) -> None:
+    """action: 'merge' | 'compress' | 'send'. Runs in the shared work slot, one file at a time."""
+    bot = context.bot
+    owner_id = session["user_id"]
+    session["running"] = True
+    slot_held = False
+    failed: list[dict] = []
+    succeeded: list[dict] = []
+    problem = ""
+
+    async def status(text: str) -> None:
+        await pdf_edit(bot, chat_id, session, text, None)
+
+    try:
+        await acquire_work_slot(status, user_priority(owner_id), user_plan_label(owner_id))
+        slot_held = True
+
+        work_dir = pdf_session_dir(session)
+        files = sorted(session["files"], key=lambda f: f["mid"])
+        total = len(files)
+
+        if action == "merge":
+            if not shutil.which("qpdf"):
+                raise RuntimeError(PDFX_NEED_QPDF)
+
+            paths = []
+            for number, entry in enumerate(files, 1):
+                await status(f"⬇️ Downloading {number}/{total}…")
+                path = work_dir / f"in_{number}.pdf"
+                await pdf_download(context, entry, path)
+                paths.append(path)
+
+            await status(f"🔗 Merging {total} PDFs…")
+            output = work_dir / "merged.pdf"
+            returncode, stderr = await run_tool(
+                ["qpdf", "--empty", "--pages", *[str(p) for p in paths], "--", str(output)],
+                PDF_JOB_TIMEOUT,
+            )
+
+            # qpdf exits with 3 when it finished but had warnings: the output is fine.
+            if returncode not in (0, 3) or not output.exists():
+                raise RuntimeError(f"couldn't merge ({pdf_short_error(stderr)})")
+
+            for path in paths:
+                path.unlink(missing_ok=True)
+
+            await status("⬆️ Sending…")
+            await pdf_send(
+                context, chat_id, session, output,
+                pdf_output_name(session, None, "", 1, 1),
+                f"🔗 Merged {total} PDFs · {format_size(output.stat().st_size)}",
+            )
+            output.unlink(missing_ok=True)
+            succeeded = files
+
+        else:
+            if action == "compress" and not shutil.which("gs"):
+                raise RuntimeError(PDFX_NEED_GS)
+
+            for number, entry in enumerate(files, 1):
+                source = work_dir / f"in_{number}.pdf"
+                output = work_dir / f"out_{number}.pdf"
+
+                try:
+                    await status(f"⬇️ Downloading {number}/{total}…")
+                    await pdf_download(context, entry, source)
+                    original_size = source.stat().st_size
+
+                    if action == "compress":
+                        label, preset, _detail = PDF_COMPRESS_LEVELS[level]
+                        await status(f"🗜 Compressing {number}/{total} ({label.split(' ', 1)[1]})… this can take a minute")
+                        returncode, stderr = await run_tool(
+                            [
+                                "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.5",
+                                f"-dPDFSETTINGS={preset}",
+                                "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER",
+                                f"-sOutputFile={output}", str(source),
+                            ],
+                            PDF_JOB_TIMEOUT,
+                        )
+
+                        if returncode != 0 or not output.exists():
+                            raise RuntimeError(f"couldn't compress ({pdf_short_error(stderr)})")
+
+                        new_size = output.stat().st_size
+
+                        if new_size >= original_size:
+                            # Never hand back a bigger file.
+                            send_path = source
+                            caption = f"ℹ️ This PDF is already well optimized — I couldn't make it smaller ({format_size(original_size)})."
+                        else:
+                            send_path = output
+                            saved = (1 - new_size / original_size) * 100
+                            caption = f"🗜 {format_size(original_size)} → {format_size(new_size)} (−{saved:.0f}%)"
+
+                        filename = pdf_output_name(session, entry, " (compressed)", number, total)
+                    else:
+                        send_path = source
+                        caption = f"📄 {format_size(original_size)}"
+                        filename = pdf_output_name(session, entry, "", number, total)
+
+                    await status(f"⬆️ Sending {number}/{total}…")
+                    await pdf_send(context, chat_id, session, send_path, filename, caption)
+                    succeeded.append(entry)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.exception("PDF job failed for %s", entry.get("name"))
+                    failed.append(entry)
+                    problem = str(error)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ {entry['name']}: {error}",
+                    )
+                finally:
+                    # Free the space before the next file starts.
+                    source.unlink(missing_ok=True)
+                    output.unlink(missing_ok=True)
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.exception("PDF job failed")
+        failed = list(session["files"])
+        succeeded = []
+        problem = str(error)
+        with contextlib.suppress(Exception):
+            await bot.send_message(chat_id=chat_id, text=f"❌ {error}")
+    finally:
+        session["running"] = False
+        if slot_held:
+            release_work_slot()
+
+    if failed:
+        # Keep only the files that didn't work so they can try again; give back what was
+        # charged for the ones that failed.
+        session["files"] = failed
+        refund = sum(int(f.get("charged") or 0) for f in failed)
+        if refund > 0 and quota_applies(owner_id):
+            quota_refund(owner_id, refund)
+        for entry in failed:
+            entry["charged"] = 0
+
+        session["last_active"] = time.time()
+        with contextlib.suppress(Exception):
+            await pdf_render(bot, chat_id, session, "menu")
+        return
+
+    pdf_forget_session(chat_id, session)
+    with contextlib.suppress(Exception):
+        await bot.send_message(chat_id=chat_id, text="✅ Done. Send another PDF whenever you like.")
+        # The old menu message is just clutter now.
+        if session.get("menu_mid") is not None:
+            await bot.delete_message(chat_id=chat_id, message_id=session["menu_mid"])
+
+
+async def handle_pdf_callback(query, context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -> None:
+    """Every button of the PDF menu (callback data: pdfx:<command>:<list id>)."""
+    try:
+        _prefix, command, sid_text = query.data.split(":", 2)
+        sid = int(sid_text)
+    except ValueError:
+        await query.answer()
+        return
+
+    chat_id = query.message.chat_id if query.message else None
+    session = pdf_file_sessions.get(chat_id) if chat_id is not None else None
+
+    if session is None or session["sid"] != sid:
+        await query.answer(PDFX_EXPIRED, show_alert=True)
+        return
+
+    if session["user_id"] != user_id and not is_admin(user_id):
+        await query.answer(PDFX_NOT_YOURS, show_alert=True)
+        return
+
+    if session.get("running"):
+        await query.answer(PDFX_BUSY, show_alert=True)
+        return
+
+    session["last_active"] = time.time()
+    bot = context.bot
+
+    if command == "gomerge" and len(session["files"]) < 2:
+        await query.answer(PDFX_NEED_TWO, show_alert=True)
+        return
+
+    await query.answer()
+
+    # Leaving a "send me the name / picture" screen cancels the wait.
+    waiting = awaiting_input.get(chat_id)
+    if waiting and waiting.get("field") in ("pdfname", "pdfthumb"):
+        awaiting_input.pop(chat_id, None)
+
+    if command == "menu":
+        await pdf_render(bot, chat_id, session, "menu")
+    elif command == "merge":
+        await pdf_render(bot, chat_id, session, "merge")
+    elif command == "compress":
+        await pdf_render(bot, chat_id, session, "compress")
+    elif command == "name":
+        await pdf_render(bot, chat_id, session, "name")
+    elif command == "setname":
+        awaiting_input[chat_id] = {"mid": sid, "field": "pdfname"}
+        await pdf_render(bot, chat_id, session, "askname")
+    elif command == "setthumb":
+        awaiting_input[chat_id] = {"mid": sid, "field": "pdfthumb"}
+        await pdf_render(bot, chat_id, session, "askthumb")
+    elif command == "clearmeta":
+        session.pop("out_name", None)
+        thumb = session.pop("thumb_path", None)
+        if thumb:
+            Path(thumb).unlink(missing_ok=True)
+        await pdf_render(bot, chat_id, session, "name")
+    elif command == "gomerge":
+        await run_pdf_job(context, chat_id, session, "merge")
+    elif command == "sendnow":
+        await run_pdf_job(context, chat_id, session, "send")
+    elif command.startswith("c_") and command[2:] in PDF_COMPRESS_LEVELS:
+        await run_pdf_job(context, chat_id, session, "compress", command[2:])
+    elif command == "cancel":
+        refunded = pdf_refund_all(session)
+        pdf_forget_session(chat_id, session)
+        await pdf_edit_final(query, PDFX_CANCELLED_REFUNDED.format(size=refunded) if refunded else PDFX_CANCELLED)
+
+
+async def pdf_edit_final(query, text: str) -> None:
+    with contextlib.suppress(Exception):
+        await query.edit_message_text(text)
+
+
+async def handle_pdf_text(update: Update, context: ContextTypes.DEFAULT_TYPE, waiting: dict) -> None:
+    """The text message the PDF menu asked for (the new file name)."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    session = pdf_file_sessions.get(chat_id)
+
+    if session is None or session["sid"] != waiting["mid"]:
+        awaiting_input.pop(chat_id, None)
+        await message.reply_text(PDFX_EXPIRED)
+        return
+
+    if waiting["field"] != "pdfname":
+        await message.reply_text(PDFX_SEND_AN_IMAGE)
+        return
+
+    text = (message.text or "").strip()
+
+    if text == "-":
+        session.pop("out_name", None)
+    else:
+        if text.lower().endswith(".pdf"):
+            text = text[:-4]
+        cleaned = sanitize_filename(text)
+
+        if not cleaned:
+            await message.reply_text(PDFX_NAME_HAS_NO_USABLE)
+            return
+
+        session["out_name"] = cleaned
+
+    awaiting_input.pop(chat_id, None)
+    session["last_active"] = time.time()
+    await pdf_render(context.bot, chat_id, session, "name")
+
+
+async def apply_pdf_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
+    """The picture the PDF menu asked for: shrink it to Telegram's thumbnail limits and keep it."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    waiting = awaiting_input.get(chat_id)
+    session = pdf_file_sessions.get(chat_id)
+
+    if waiting is None or waiting.get("field") != "pdfthumb":
+        return
+
+    if session is None or session["sid"] != waiting["mid"]:
+        awaiting_input.pop(chat_id, None)
+        await message.reply_text(PDFX_EXPIRED)
+        return
+
+    work_dir = pdf_session_dir(session)
+    source = work_dir / f"thumb_src_{message.message_id}"
+    thumb = work_dir / "thumb.jpg"
+    status_message = await message.reply_text(MSG_PROCESSING_THE_IMAGE)
+
+    try:
+        telegram_file = await with_retries(context.bot.get_file, file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(source))
+        delete_server_copy(telegram_file)
+
+        # Telegram wants a JPEG up to 320px and 200 KB; retry smaller if it comes out heavy.
+        ok = await prepare_cover_image(str(source), str(thumb), 320, "5")
+        if ok and thumb.stat().st_size > 190 * 1024:
+            ok = await prepare_cover_image(str(source), str(thumb), 320, "15")
+    except Exception as error:
+        logger.exception("Error preparing PDF thumbnail:")
+        await status_message.edit_text(MSG_COULDN_T_DOWNLOAD_THAT_IMAGE.format(error=error))
+        return
+    finally:
+        source.unlink(missing_ok=True)
+
+    if not ok:
+        await status_message.edit_text(PDFX_THUMB_FAILED)
+        return
+
+    session["thumb_path"] = thumb
+    session["last_active"] = time.time()
+    awaiting_input.pop(chat_id, None)
+
+    with contextlib.suppress(Exception):
+        await status_message.delete()
+
+    await pdf_render(context.bot, chat_id, session, "name")
+
+
+async def expire_idle_pdf_sessions(bot) -> int:
+    """Drop PDF lists nobody has touched for PDF_IDLE_MINUTES (refunding the daily limit)."""
+    if PDF_IDLE_MINUTES <= 0:
+        return 0
+
+    now = time.time()
+    removed = 0
+
+    for chat_id, session in list(pdf_file_sessions.items()):
+        if session.get("running"):
+            continue
+
+        if now - session.get("last_active", now) < PDF_IDLE_MINUTES * 60:
+            continue
+
+        refunded = pdf_refund_all(session)
+        pdf_forget_session(chat_id, session)
+        removed += 1
+
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    PDFX_IDLE_REFUNDED.format(minutes=PDF_IDLE_MINUTES, size=refunded)
+                    if refunded
+                    else PDFX_IDLE.format(minutes=PDF_IDLE_MINUTES)
+                ),
+            )
+
+    return removed
+
+
+# ============================================================
+# RAR archives: extract and send the contents back
+# ============================================================
+#
+# Send the bot a .rar and it unpacks it and sends every file back, one by one
+# (each file is deleted from the server right after it is sent, so the space is
+# freed as it goes). If the archive has a password, send it again with the
+# password written as the caption.
+#
+# Needs the "unrar" program inside the container (see the Dockerfile line).
+# If it is missing, "7zz" / "7z" is used instead when one is installed.
+
+RAR_MAX_EXTRACT_MB = int(os.getenv("RAR_MAX_EXTRACT_MB", "1500"))   # biggest total size we will unpack
+RAR_MAX_FILES = int(os.getenv("RAR_MAX_FILES", "100"))              # most files we will send back
+RAR_MAX_SEND_MB = int(os.getenv("RAR_MAX_SEND_MB", "1990"))         # Telegram's limit for one file
+RAR_EXTRACT_TIMEOUT = int(os.getenv("RAR_EXTRACT_TIMEOUT", "900"))  # seconds
+RAR_SEND_PAUSE = float(os.getenv("RAR_SEND_PAUSE", "1.0"))          # seconds between files (Telegram rate limit)
+
+# "name.part2.rar", "name.part03.rar" ... (the first part, part1, is fine on its own only
+# if it is a single volume; the others can never be opened alone)
+RAR_LATER_PART_RE = re.compile(r"\.part0*([2-9]|[1-9]\d+)\.rar$", re.IGNORECASE)
+
+RARX_NEED_TOOL = "Opening RAR files isn't set up on this server yet (unrar is missing)."
+RARX_MULTIPART = (
+    "⚠️ That's one piece of a multi-part archive (.part2.rar and so on). "
+    "I can only open a single .rar file — please send it as one file."
+)
+RARX_EMPTY = "the archive is empty"
+RARX_TOO_BIG = "it unpacks to more than {mb} MB, which is more than this server can hold"
+RARX_NO_ROOM = "there isn't enough free space on the server to unpack it"
+RARX_TIMEOUT = "unpacking took too long and was stopped"
+
+
+def is_rar_document(document) -> bool:
+    mime = (document.mime_type or "").lower()
+    name = (document.file_name or "").lower()
+    return name.endswith(".rar") or mime in ("application/vnd.rar", "application/x-rar-compressed", "application/x-rar")
+
+
+def find_rar_tool() -> str | None:
+    for candidate in ("unrar", "7zz", "7z"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+def directory_size(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def natural_key(text: str) -> list:
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", text.lower())]
+
+
+def collect_extracted_files(dest: Path) -> list[Path]:
+    """Every real file under dest (never a link, never anything that points outside it), in natural order."""
+    root = dest.resolve()
+    found = []
+
+    for path in dest.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        found.append(path)
+
+    # Sort folder by folder (so "sub" comes before "sub2"), with numbers in natural order (2 before 10).
+    return sorted(found, key=lambda p: [natural_key(part) for part in p.relative_to(dest).parts])
+
+
+def rar_short_error(stderr: str) -> str:
+    lowered = stderr.lower()
+
+    if "password" in lowered or "encrypted" in lowered:
+        return "it's password-protected (or the password was wrong) — send it again with the password as the caption"
+    if "volume" in lowered or "next part" in lowered:
+        return "it looks like a multi-part archive, which I can't open"
+    if "not rar archive" in lowered or "not a rar" in lowered or "is not rar" in lowered or "cannot open" in lowered:
+        return "that doesn't look like a valid RAR file"
+
+    lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+    return lines[-1][:200] if lines else "unknown error"
+
+
+async def extract_rar(archive: Path, dest: Path, password: str | None) -> None:
+    """Unpack archive into dest. Raises RuntimeError with a plain-language reason."""
+    tool = find_rar_tool()
+    if tool is None:
+        raise RuntimeError(RARX_NEED_TOOL)
+
+    # Never let a huge archive (a "zip bomb") fill the disk: stop it at the limit.
+    free = shutil.disk_usage(dest).free
+    limit = min(RAR_MAX_EXTRACT_MB * 1024 * 1024, free - 200 * 1024 * 1024)
+    if limit <= 0:
+        raise RuntimeError(RARX_NO_ROOM)
+
+    if Path(tool).name == "unrar":
+        command = [tool, "x", "-y", "-idq", "-o+", f"-p{password}" if password else "-p-", str(archive), str(dest) + "/"]
+    else:
+        command = [tool, "x", "-y", "-bd", f"-o{dest}"]
+        if password:
+            command.append(f"-p{password}")
+        command.append(str(archive))
+
+    if FFMPEG_NICE > 0 and shutil.which("nice"):
+        command = ["nice", "-n", str(FFMPEG_NICE), *command]
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    exceeded = False
+
+    async def watch_size() -> None:
+        nonlocal exceeded
+        while True:
+            await asyncio.sleep(1)
+            if await asyncio.to_thread(directory_size, dest) > limit:
+                exceeded = True
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                return
+
+    watcher = asyncio.create_task(watch_size())
+
+    try:
+        _stdout, stderr = await asyncio.wait_for(process.communicate(), RAR_EXTRACT_TIMEOUT)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.wait()
+        raise RuntimeError(RARX_TIMEOUT)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await watcher
+
+    if exceeded:
+        raise RuntimeError(RARX_TOO_BIG.format(mb=int(limit / 1024 / 1024)))
+
+    # 0 = fine, 1 = finished with a minor warning (the files are still good).
+    if process.returncode not in (0, 1):
+        raise RuntimeError(rar_short_error(stderr.decode(errors="replace")))
+
+
+async def handle_rar_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE, document) -> None:
+    """A .rar arrived: unpack it and send each file back."""
+    global other_jobs_running
+
+    message = update.effective_message
+    chat_id = message.chat_id
+    user_id = update.effective_user.id if update.effective_user else None
+    archive_name = document.file_name or "archive.rar"
+
+    if chat_id in merge_sessions:
+        await message.reply_text(MSG_MERGE_VIDEOS_ONLY)
+        return
+
+    if update_mode["on"] and not is_admin(user_id):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    if RAR_LATER_PART_RE.search(archive_name):
+        await message.reply_text(RARX_MULTIPART)
+        return
+
+    if find_rar_tool() is None:
+        await message.reply_text(RARX_NEED_TOOL)
+        return
+
+    size = int(document.file_size or 0)
+
+    if file_too_large(user_id, size):
+        await message.reply_text(file_too_large_text(user_id, size))
+        return
+
+    if not quota_allows(user_id, size):
+        await message.reply_text(quota_refusal_text(user_id, size))
+        return
+
+    quota_consume(user_id, size)
+
+    password = (message.caption or "").strip() or None
+
+    other_jobs_running += 1
+    update_mode["notified"] = False
+
+    work_dir: Path | None = None
+    slot_held = False
+    status_message = None
+    sent_count = 0
+
+    async def post_status(text: str) -> None:
+        nonlocal status_message
+        if status_message is None:
+            status_message = await message.reply_text(text)
+        else:
+            await status_message.edit_text(text)
+
+    try:
+        await acquire_work_slot(post_status, user_priority(user_id), user_plan_label(user_id))
+        slot_held = True
+
+        Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix=f"rar_{message.message_id}_", dir=TEMP_DIR))
+        archive = work_dir / "archive.rar"
+        dest = work_dir / "out"
+        dest.mkdir()
+
+        await post_status(f"⬇️ Downloading {archive_name} ({format_size(size)})…")
+        telegram_file = await with_retries(context.bot.get_file, document.file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(archive))
+        delete_server_copy(telegram_file)
+
+        await post_status("📦 Unpacking… (big archives can take a few minutes)")
+        await extract_rar(archive, dest, password)
+        archive.unlink(missing_ok=True)   # free the space the archive was using
+
+        files = collect_extracted_files(dest)
+
+        if not files:
+            raise RuntimeError(RARX_EMPTY)
+
+        skipped_big: list[str] = []
+        skipped_empty = 0
+        sendable = []
+
+        for path in files:
+            file_size = path.stat().st_size
+            relative = str(path.relative_to(dest))
+
+            if file_size == 0:
+                skipped_empty += 1
+            elif file_size > RAR_MAX_SEND_MB * 1024 * 1024:
+                skipped_big.append(relative)
+            else:
+                sendable.append(path)
+
+        skipped_extra = max(0, len(sendable) - RAR_MAX_FILES)
+        sendable = sendable[:RAR_MAX_FILES]
+
+        # Two files with the same name in different folders: keep the folder in the name.
+        name_counts: dict[str, int] = {}
+        for path in sendable:
+            name_counts[path.name] = name_counts.get(path.name, 0) + 1
+
+        total = len(sendable)
+
+        for number, path in enumerate(sendable, 1):
+            relative = str(path.relative_to(dest))
+            file_size = path.stat().st_size
+            send_name = path.name if name_counts[path.name] == 1 else relative.replace("/", " - ")
+
+            await post_status(f"⬆️ Sending {number}/{total}: {path.name[:60]}")
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+            await with_retries(
+                context.bot.send_document,
+                chat_id=chat_id,
+                document=str(path),
+                filename=send_name,
+                caption=f"📦 {relative[:300]} · {format_size(file_size)}",
+            )
+            sent_count += 1
+
+            # Free the space right away, before the next file.
+            path.unlink(missing_ok=True)
+
+            if number < total:
+                await asyncio.sleep(RAR_SEND_PAUSE)
+
+        notes = []
+        if skipped_big:
+            notes.append(f"⚠️ Too big for Telegram, not sent: {', '.join(skipped_big[:5])}" + (" …" if len(skipped_big) > 5 else ""))
+        if skipped_extra:
+            notes.append(f"⚠️ Only the first {RAR_MAX_FILES} files were sent; {skipped_extra} more were skipped.")
+        if skipped_empty:
+            notes.append(f"ℹ️ {skipped_empty} empty file(s) were skipped.")
+
+        if sent_count == 0:
+            raise RuntimeError("there was nothing I could send from it")
+
+        await post_status("\n".join([f"✅ Sent {sent_count} file(s) from {archive_name}.", *notes]))
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.exception("Error unpacking RAR:")
+
+        # Nothing came back to them: give the daily-limit bytes back.
+        if sent_count == 0 and size > 0 and quota_applies(user_id):
+            quota_refund(user_id, size)
+
+        text = f"❌ Couldn't open {archive_name}: {error}"
+        if sent_count:
+            text = f"❌ Stopped after {sent_count} file(s): {error}"
+
+        with contextlib.suppress(Exception):
+            await post_status(text)
+    finally:
+        if slot_held:
+            release_work_slot()
+        if work_dir is not None:
+            cleanup_work_dir(work_dir)
+        other_jobs_running -= 1
+        await maybe_notify_update_ready(context.bot)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -8229,11 +9261,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     waiting_input = awaiting_input.get(message.chat_id)
+    if is_image and waiting_input is not None and waiting_input["field"] == "pdfthumb":
+        await apply_pdf_thumbnail(update, context, document.file_id)
+        return
+
     if is_image and waiting_input is not None:
         if waiting_input["field"] in ("cover", "videocover"):
             await apply_cover_image(update, context, document.file_id)
         else:
             await message.reply_text(MSG_I_M_WAITING_FOR_TEXT)
+        return
+
+    if is_pdf_document(document):
+        await handle_pdf_incoming(update, context, document)
+        return
+
+    if is_rar_document(document):
+        await handle_rar_incoming(update, context, document)
         return
 
     is_video = (
@@ -8300,6 +9344,7 @@ def nothing_in_progress() -> bool:
 def open_menu_count() -> int:
     """Analyzed videos whose owner hasn't tapped anything yet (lost on restart)."""
     menus = sum(1 for message_id in pending_compressions if message_id not in active_job_ids)
+    menus += sum(1 for session in pdf_file_sessions.values() if not session.get("running"))
     return menus + sum(1 for session in merge_sessions.values() if not session.get("running"))
 
 
@@ -8405,7 +9450,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     query = update.callback_query
     action = (query.data or "").split(":", 1)[0] if query else ""
-    tracked = action in ("pdf", "pdfauto", "pdfdedup")
+    tracked = action in ("pdf", "pdfauto", "pdf3", "pdfdedup", "pdfx")
 
     if tracked:
         other_jobs_running += 1
@@ -8440,6 +9485,10 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     if query.data.startswith("subsoon:"):
         await query.answer(MSG_SUBSCRIPTIONS_COMING_SOON, show_alert=True)
+        return
+
+    if query.data.startswith("pdfx:"):
+        await handle_pdf_callback(query, context, user_id)
         return
 
     if query.data.startswith("toobig:"):
@@ -8776,6 +9825,152 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=MSG_SOMETHING_WENT_WRONG_SCANNING_THE.format(error=error),
+            )
+            clear_pending(message_id)
+
+        return
+
+    if action == "pdf3":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(MSG_THAT_VIDEO_ISN_T_IN_2)
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        status_message = query.message
+
+        if not duration or duration <= 0:
+            await status_message.edit_text(MSG_PDF3_NEEDS_DURATION)
+            return
+
+        # Same sampling rule as "Auto-detect changes", based on the WHOLE video,
+        # so the total number of sampled frames stays capped across all 3 parts.
+        interval = max(SMART_CAPTURE_BASE_INTERVAL, duration / SMART_CAPTURE_MAX_CANDIDATES)
+
+        # 33% / 33% / 34% of the timeline.
+        boundaries = [0.0, duration * 0.33, duration * 0.66, duration]
+        previous_signature: bytes | None = None   # last kept frame of the previous part
+        total_kept = 0
+        failed_parts = 0
+
+        try:
+            for part in (1, 2, 3):
+                part_start = boundaries[part - 1]
+                part_end = boundaries[part]
+                part_length = part_end - part_start
+                start_text = format_duration(part_start)
+                end_text = format_duration(part_end)
+
+                part_dir = work_dir / f"part{part}"
+                part_dir.mkdir(exist_ok=True)
+
+                scan_label = MSG_PDF3_SCANNING_PART.format(part=part, interval=interval)
+                await status_message.edit_text(f"{scan_label}\n{render_progress_bar(0)}")
+
+                candidate_paths = await extract_frames_at_interval(
+                    str(input_path),
+                    part_dir,
+                    interval,
+                    total_duration=part_length,
+                    progress_callback=make_progress_editor(status_message, scan_label),
+                    start=part_start,
+                    length=part_length,
+                )
+
+                if not candidate_paths:
+                    failed_parts += 1
+                    cleanup_work_dir(part_dir)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=MSG_PDF3_PART_FAILED.format(part=part, start=start_text, end=end_text),
+                    )
+                    continue
+
+                compare_label = MSG_PDF3_COMPARING_PART.format(part=part, count=len(candidate_paths))
+                await status_message.edit_text(f"{compare_label}\n{render_progress_bar(0)}")
+
+                kept_paths, removed_paths, threshold_used = await dedup_frames(
+                    candidate_paths,
+                    progress_callback=make_progress_editor(status_message, compare_label),
+                )
+
+                for path in removed_paths:
+                    path.unlink(missing_ok=True)
+
+                # A slide that continues across the cut between two parts must not
+                # show up twice: compare this part's first frame with the previous
+                # part's last kept frame.
+                if previous_signature is not None and kept_paths:
+                    first_signature = await compute_frame_signature(str(kept_paths[0]))
+                    if (
+                        first_signature is not None
+                        and frames_are_near_identical(first_signature, previous_signature, threshold_used)
+                        and len(kept_paths) > 1
+                    ):
+                        kept_paths[0].unlink(missing_ok=True)
+                        kept_paths.pop(0)
+
+                previous_signature = await compute_frame_signature(str(kept_paths[-1]))
+
+                await status_message.edit_text(MSG_PDF3_BUILDING_PART.format(part=part))
+
+                pdf_path = part_dir / f"frames_part{part}.pdf"
+                pdf_bytes = await asyncio.to_thread(
+                    img2pdf.convert, [str(path) for path in kept_paths]
+                )
+                pdf_path.write_bytes(pdf_bytes)
+                del pdf_bytes
+
+                await with_retries(
+                    context.bot.send_document,
+                    chat_id=chat_id,
+                    document=str(pdf_path),
+                    filename=f"frames_part{part}.pdf",
+                    caption=MSG_PDF3_PART_CAPTION.format(
+                        part=part,
+                        start=start_text,
+                        end=end_text,
+                        kept=len(kept_paths),
+                        sampled=len(candidate_paths),
+                        interval=interval,
+                        threshold=threshold_used,
+                    ),
+                )
+
+                total_kept += len(kept_paths)
+
+                # Free the space NOW (frames + this part's PDF) before the next part starts.
+                cleanup_work_dir(part_dir)
+
+            if failed_parts == 3:
+                await status_message.edit_text(MSG_COULDN_T_EXTRACT_ANY_FRAMES)
+                clear_pending(message_id)
+                return
+
+            await status_message.edit_text(MSG_PDF3_DONE)
+
+            # The video stays so they can still compress it or finish the session.
+            # The frames are gone (that was the point), so no "auto-delete similar frames".
+            pending["interval"] = interval
+            open_pdf_sessions[chat_id] = message_id
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=MSG_WHAT_WOULD_YOU_LIKE_TO,
+                reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
+            )
+
+        except Exception as error:
+            logger.exception("Error during 3-part PDF extraction:")
+            for part in (1, 2, 3):
+                cleanup_work_dir(work_dir / f"part{part}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=MSG_SOMETHING_WENT_WRONG_EXTRACTING_FRAM.format(error=error),
             )
             clear_pending(message_id)
 
