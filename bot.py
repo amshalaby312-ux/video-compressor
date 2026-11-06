@@ -5274,6 +5274,10 @@ async def extract_frames_at_interval(
         command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
 
     command += [
+        # Limit the decoder's threads (same setting the compression uses) —
+        # without this FFmpeg picks its own count from the host's core count
+        # and holds that many decoded frames in RAM.
+        "-threads", DECODER_THREADS,
         "-i", input_path,
         "-vf", f"fps=1/{interval}",
         "-q:v", "3",
