@@ -4,7 +4,7 @@ FROM aiogram/telegram-bot-api:latest AS botapi
 # Stage 2: your actual bot image — Alpine, to match the musl-linked binary above
 FROM python:3.12-alpine
 
-RUN apk add --no-cache ffmpeg ca-certificates qpdf ghostscript unrar
+RUN apk add --no-cache ffmpeg ca-certificates qpdf ghostscript 7zip
 
 # Bring in the telegram-bot-api server binary from stage 1
 COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
